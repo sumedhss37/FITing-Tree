@@ -1,0 +1,5 @@
+# fiting_tree extension
+comment = 'FITing-Tree learned index access method (CS349 Checkpoint 1)'
+default_version = '1.0'
+module_pathname = '$libdir/fiting_tree'
+relocatable = true
