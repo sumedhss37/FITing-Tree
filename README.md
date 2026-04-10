@@ -7,7 +7,7 @@ To run the code, follow the below steps:
 
 1) ./configure --enable-debug --without-icu
 2) make 
-3) sudo amke install
+3) sudo make install
 4) make -C contrib/fiting_tree clean
 5) make -C contrib/fiting_tree
 6) sudo make -C contrib/fiting_tree install
