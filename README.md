@@ -21,13 +21,11 @@ Sample commands:
 DROP EXTENSION fiting_tree;
 CREATE EXTENSION fiting_tree;
 
--- ---- int4 (existing behavior) ----
 CREATE TABLE t_int (id int4);
 INSERT INTO t_int SELECT generate_series(1, 10000);
 CREATE INDEX ON t_int USING fiting (id);
 SELECT * FROM t_int WHERE id = 5000;
 
--- ---- timestamp ----
 CREATE TABLE t_ts (ts timestamp);
 INSERT INTO t_ts
     SELECT '2020-01-01 00:00:00'::timestamp + (i * interval '1 second')
@@ -41,7 +39,6 @@ DELETE FROM t_ts WHERE ts = '2020-01-01 00:00:01';
 VACUUM t_ts;
 SELECT * FROM t_ts WHERE ts = '2020-01-01 00:00:01';   -- deleted
 
--- ---- timestamptz ----
 CREATE TABLE t_tstz (ts timestamptz);
 INSERT INTO t_tstz
     SELECT '2020-01-01 00:00:00+00'::timestamptz + (i * interval '1 second')
@@ -50,7 +47,7 @@ CREATE INDEX ON t_tstz USING fiting (ts);
 SELECT * FROM t_tstz WHERE ts = '2020-01-01 01:23:45+00';
 
 CREATE INDEX ON t_ts USING btree (ts);
--- Compare index sizes
+
 SELECT 
     indexrelid::regclass AS index_name,
     pg_size_pretty(pg_relation_size(indexrelid)) AS size,
