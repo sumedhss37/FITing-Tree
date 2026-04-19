@@ -32,12 +32,12 @@ INSERT INTO t_ts
     FROM generate_series(1, 10000) AS i;
 CREATE INDEX ON t_ts USING fiting (ts);
 
-SELECT * FROM t_ts WHERE ts = '2020-01-01 01:23:45';   -- exact match
+SELECT * FROM t_ts WHERE ts = '2020-01-01 01:23:45';  
 INSERT INTO t_ts VALUES ('2025-06-15 12:00:00');
-SELECT * FROM t_ts WHERE ts = '2025-06-15 12:00:00';   -- buffer hit
+SELECT * FROM t_ts WHERE ts = '2025-06-15 12:00:00';
 DELETE FROM t_ts WHERE ts = '2020-01-01 00:00:01';
 VACUUM t_ts;
-SELECT * FROM t_ts WHERE ts = '2020-01-01 00:00:01';   -- deleted
+SELECT * FROM t_ts WHERE ts = '2020-01-01 00:00:01';
 
 CREATE TABLE t_tstz (ts timestamptz);
 INSERT INTO t_tstz
