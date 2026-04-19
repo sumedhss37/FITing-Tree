@@ -20,18 +20,35 @@ CREATE ACCESS METHOD fiting
     HANDLER fiting_handler;
 
 COMMENT ON ACCESS METHOD fiting IS
-    'FITing-Tree: piecewise-linear learned index (CS349 Checkpoint 1)';
+    'FITing-Tree: piecewise-linear learned index (CS349 Checkpoint 2)';
 
 -- -------------------------------------------------------------------------
--- 3. Operator class for int4
+-- 3. Operator classes
 --
 --    Strategy 1  =   equality
---    Support  1  btint4cmp   comparison function (reused from btree)
+--    Support  1      comparison function (reused from btree)
 --
---    Checkpoint 1 supports equality lookups only.
+--    Supported types: int4, timestamp, timestamptz.
+--    Keys are stored internally as int64 for all types.
 -- -------------------------------------------------------------------------
+
+-- int4
 CREATE OPERATOR CLASS fiting_int4_ops
     DEFAULT FOR TYPE int4
     USING fiting AS
         OPERATOR 1  =  (int4, int4),
         FUNCTION 1  btint4cmp(int4, int4);
+
+-- timestamp (without time zone)
+CREATE OPERATOR CLASS fiting_timestamp_ops
+    DEFAULT FOR TYPE timestamp
+    USING fiting AS
+        OPERATOR 1  =  (timestamp, timestamp),
+        FUNCTION 1  timestamp_cmp(timestamp, timestamp);
+
+-- timestamptz (with time zone)
+CREATE OPERATOR CLASS fiting_timestamptz_ops
+    DEFAULT FOR TYPE timestamptz
+    USING fiting AS
+        OPERATOR 1  =  (timestamptz, timestamptz),
+        FUNCTION 1  timestamptz_cmp(timestamptz, timestamptz);

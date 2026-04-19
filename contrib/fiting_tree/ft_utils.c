@@ -51,7 +51,7 @@ FitingInitPage(Page page, uint16 flags)
 /* -----------------------------------------------------------------------
  * FitingRunShrinkingCone
  *
- * Core algorithm.  Takes a sorted int32 key array of length n and returns
+ * Core algorithm.  Takes a sorted int64 key array of length n and returns
  * an array of FitingSegment (palloced).  *num_segments_out receives the
  * count.
  *
@@ -60,7 +60,7 @@ FitingInitPage(Page page, uint16 flags)
  * for every key in that segment.
  * ----------------------------------------------------------------------- */
 FitingSegment *
-FitingRunShrinkingCone(int32 *keys, int64 n, int32 max_error,
+FitingRunShrinkingCone(int64 *keys, int64 n, int32 max_error,
 					   int *num_segments_out)
 {
 	FitingSegment *segs;
@@ -68,7 +68,7 @@ FitingRunShrinkingCone(int32 *keys, int64 n, int32 max_error,
 	int			num_segs;
 
 	int64		origin_rank;
-	int32		origin_key;
+	int64		origin_key;
 	double		cone_lo;		/* lower bound on valid slope */
 	double		cone_hi;		/* upper bound on valid slope */
 
@@ -91,7 +91,7 @@ FitingRunShrinkingCone(int32 *keys, int64 n, int32 max_error,
 
 	for (int64 i = 1; i < n; i++)
 	{
-		int32		ki = keys[i];
+		int64		ki = keys[i];
 		int64		ri = i;
 		double		dk;
 		double		s_hi, s_lo;
