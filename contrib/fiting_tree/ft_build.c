@@ -15,12 +15,14 @@
  *      so a page shared between two segments at bulk-build time survives
  *      when one segment is resegmented.
  *
- *   3. fiting_resegment() frees old pages BEFORE allocating new ones
- *      ("free first, allocate next").  Freed blocks re-enter the freelist
- *      and can be reused immediately, avoiding unnecessary file extension.
+ *   3. fiting_resegment() reuses old segment pages in-place (full overwrite,
+ *      counts set to 1), then appends to the global data_curr_page if it has
+ *      capacity, and finally falls back to the freelist / ExtendBufferedRel.
+ *      Surplus old pages are freed after writing.
  *
- *   4. fiting_write_seg_pages() now allocates via fiting_alloc_page()
- *      (freelist-first) instead of always using ExtendBufferedRel.
+ *   4. Buffer pages are shared: up to FITING_BUF_SLOTS_PER_PAGE (15) segments
+ *      share one 8 kB page.  Each segment owns a fixed 32-tuple slot tracked
+ *      by FitingDirEntry.buf_info (slot index + count, packed).
  *
  *-------------------------------------------------------------------------
  */
@@ -240,37 +242,6 @@ write_page_to_index(Relation index, uint16 page_flags,
 	UnlockReleaseBuffer(buf);
 }
 
-/* -----------------------------------------------------------------------
- * overwrite_page
- *
- * Overwrite block blkno in place under GenericXLog.
- * The block must already exist.
- * ----------------------------------------------------------------------- */
-static void
-overwrite_page(Relation index, BlockNumber blkno, uint16 page_flags,
-			   const void *data, size_t data_bytes)
-{
-	Buffer				buf;
-	Page				page;
-	GenericXLogState   *xstate;
-
-	buf = ReadBuffer(index, blkno);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-	xstate = GenericXLogStart(index);
-	page   = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
-
-	FitingInitPage(page, page_flags);
-	if (data_bytes > 0)
-	{
-		memcpy(PageGetContents(page), data, data_bytes);
-		((PageHeader) page)->pd_lower += (int) data_bytes;
-	}
-
-	GenericXLogFinish(xstate);
-	UnlockReleaseBuffer(buf);
-}
-
 /* =======================================================================
  * Canonical page I/O helpers (declared in fiting_tree.h; used by all
  * sub-modules via the extern declarations).
@@ -404,21 +375,376 @@ fiting_write_dir_page(Relation index, const FitingDirPageContent *dir)
 }
 
 /* =======================================================================
+ * Overflow-capable directory node helpers
+ * ======================================================================= */
+
+/* -----------------------------------------------------------------------
+ * fiting_get_node
+ *
+ * Read the FitingPageListNode at global index node_idx into *out.
+ * Nodes 0..FITING_DIR_MAX_NODES-1 are served from the in-memory dir copy.
+ * Higher indices walk the overflow page chain via ReadBuffer.
+ * ----------------------------------------------------------------------- */
+void
+fiting_get_node(Relation index, const FitingDirPageContent *dir,
+				int node_idx, FitingPageListNode *out)
+{
+	int			ov_idx;
+	int			page_num;
+	int			slot;
+	int			i;
+	BlockNumber	blkno;
+	Buffer		buf;
+	Page		page;
+
+	if (node_idx < 0)
+		elog(ERROR, "fiting_tree: fiting_get_node called with node_idx=%d",
+			 node_idx);
+
+	if (node_idx < FITING_DIR_MAX_NODES)
+	{
+		*out = dir->pool[node_idx];
+		return;
+	}
+
+	ov_idx   = node_idx - FITING_DIR_MAX_NODES;
+	page_num = ov_idx / FITING_DIR_OVERFLOW_NODES;
+	slot     = ov_idx % FITING_DIR_OVERFLOW_NODES;
+
+	blkno = dir->hdr.next_page;
+
+	/* Walk page_num hops along the overflow chain */
+	for (i = 0; i < page_num; i++)
+	{
+		FitingDirOverflowHeader *ohdr;
+
+		if (blkno == InvalidBlockNumber)
+			elog(ERROR,
+				 "fiting_tree: overflow dir chain too short at hop %d "
+				 "(node_idx=%d)", i, node_idx);
+
+		buf   = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page  = BufferGetPage(buf);
+		ohdr  = (FitingDirOverflowHeader *) PageGetContents(page);
+		blkno = ohdr->next_page;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (blkno == InvalidBlockNumber)
+		elog(ERROR, "fiting_tree: overflow dir page not found for node %d",
+			 node_idx);
+
+	{
+		FitingPageListNode *pool_area;
+
+		buf       = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page      = BufferGetPage(buf);
+		pool_area = (FitingPageListNode *)
+					((char *) PageGetContents(page) +
+					 sizeof(FitingDirOverflowHeader));
+		*out      = pool_area[slot];
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * fiting_put_node
+ *
+ * Write *node to global index node_idx in the directory pool.
+ * Primary nodes are updated in the in-memory dir copy (flushed later by
+ * fiting_write_dir_page).  Overflow nodes are written immediately via
+ * GenericXLog with flag 0 (preserve other slots on the overflow page).
+ * ----------------------------------------------------------------------- */
+void
+fiting_put_node(Relation index, FitingDirPageContent *dir,
+				int node_idx, const FitingPageListNode *node)
+{
+	int			ov_idx;
+	int			page_num;
+	int			slot;
+	int			i;
+	BlockNumber	blkno;
+	Buffer		buf;
+	Page		page;
+	GenericXLogState *xstate;
+	FitingPageListNode *pool_area;
+
+	if (node_idx < 0)
+		elog(ERROR, "fiting_tree: fiting_put_node called with node_idx=%d",
+			 node_idx);
+
+	if (node_idx < FITING_DIR_MAX_NODES)
+	{
+		dir->pool[node_idx] = *node;
+		return;
+	}
+
+	ov_idx   = node_idx - FITING_DIR_MAX_NODES;
+	page_num = ov_idx / FITING_DIR_OVERFLOW_NODES;
+	slot     = ov_idx % FITING_DIR_OVERFLOW_NODES;
+
+	blkno = dir->hdr.next_page;
+
+	for (i = 0; i < page_num; i++)
+	{
+		FitingDirOverflowHeader *ohdr;
+
+		if (blkno == InvalidBlockNumber)
+			elog(ERROR,
+				 "fiting_tree: overflow dir chain too short (put) at hop %d "
+				 "(node_idx=%d)", i, node_idx);
+
+		buf   = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page  = BufferGetPage(buf);
+		ohdr  = (FitingDirOverflowHeader *) PageGetContents(page);
+		blkno = ohdr->next_page;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (blkno == InvalidBlockNumber)
+		elog(ERROR,
+			 "fiting_tree: overflow dir page not found (put) for node %d",
+			 node_idx);
+
+	buf       = ReadBuffer(index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	xstate    = GenericXLogStart(index);
+	/* flag 0: keep existing content, only update our slot */
+	page      = GenericXLogRegisterBuffer(xstate, buf, 0);
+	pool_area = (FitingPageListNode *)
+				((char *) PageGetContents(page) +
+				 sizeof(FitingDirOverflowHeader));
+	pool_area[slot] = *node;
+	GenericXLogFinish(xstate);
+	UnlockReleaseBuffer(buf);
+}
+
+/* -----------------------------------------------------------------------
+ * alloc_new_overflow_dir_page  [static]
+ *
+ * Allocate a fresh overflow dir page via fiting_alloc_page, initialise it
+ * (FITING_F_DIR flag, zeroed pool), and append it to the overflow chain
+ * rooted at dir->hdr.next_page.  Updates dir->hdr.next_page in memory if
+ * this is the first overflow page; otherwise updates the old tail via
+ * GenericXLog.
+ * ----------------------------------------------------------------------- */
+static void
+alloc_new_overflow_dir_page(Relation index, FitingDirPageContent *dir,
+							 FitingMetaPageData *meta, int32 *counts)
+{
+	BlockNumber		 new_blkno;
+	Buffer			 buf;
+	Page			 page;
+	GenericXLogState *xstate;
+	FitingDirOverflowHeader *ohdr;
+
+	new_blkno = fiting_alloc_page(index, meta, counts);
+
+	buf    = ReadBuffer(index, new_blkno);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	xstate = GenericXLogStart(index);
+	page   = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
+
+	FitingInitPage(page, FITING_F_DIR);
+	ohdr            = (FitingDirOverflowHeader *) PageGetContents(page);
+	ohdr->next_page = InvalidBlockNumber;
+	ohdr->pad       = 0;
+	memset(ohdr + 1, 0,
+		   FITING_DIR_OVERFLOW_NODES * sizeof(FitingPageListNode));
+	((PageHeader) page)->pd_lower +=
+		(int) (sizeof(FitingDirOverflowHeader) +
+			   FITING_DIR_OVERFLOW_NODES * sizeof(FitingPageListNode));
+
+	GenericXLogFinish(xstate);
+	UnlockReleaseBuffer(buf);
+
+	/* Link the new page into the overflow chain */
+	if (dir->hdr.next_page == InvalidBlockNumber)
+	{
+		/* First overflow page — record in in-memory dir header */
+		dir->hdr.next_page = new_blkno;
+	}
+	else
+	{
+		/* Find the chain tail and set its next_page */
+		BlockNumber cur = dir->hdr.next_page;
+
+		for (;;)
+		{
+			BlockNumber cur_next;
+
+			buf      = ReadBuffer(index, cur);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page     = BufferGetPage(buf);
+			cur_next = ((FitingDirOverflowHeader *) PageGetContents(page))->next_page;
+			UnlockReleaseBuffer(buf);
+
+			if (cur_next == InvalidBlockNumber)
+			{
+				/* cur is the tail — update it */
+				buf    = ReadBuffer(index, cur);
+				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+				xstate = GenericXLogStart(index);
+				page   = GenericXLogRegisterBuffer(xstate, buf, 0);
+				((FitingDirOverflowHeader *) PageGetContents(page))->next_page =
+					new_blkno;
+				GenericXLogFinish(xstate);
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+			cur = cur_next;
+		}
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * fiting_dir_alloc_node  [runtime — used by fiting_resegment]
+ *
+ * Pop a node from the freelist, or claim the next primary slot, or claim
+ * the next slot on the current overflow page (allocating a new overflow
+ * page when needed).  Returns the global node index.
+ * Caller must eventually flush dir via fiting_write_dir_page (for the
+ * updated header fields) and meta+counts via fiting_write_meta_and_counts.
+ * ----------------------------------------------------------------------- */
+int
+fiting_dir_alloc_node(FitingDirPageContent *dir, Relation index,
+					   FitingMetaPageData *meta, int32 *counts)
+{
+	int idx;
+
+	/* 1. Pop from freelist (may be a primary or overflow index) */
+	if (dir->hdr.pool_freelist >= 0)
+	{
+		FitingPageListNode fn;
+
+		idx = dir->hdr.pool_freelist;
+		fiting_get_node(index, dir, idx, &fn);
+		dir->hdr.pool_freelist = fn.next;
+		/* Caller will fill the node contents via fiting_put_node */
+		return idx;
+	}
+
+	/* 2. Claim next primary slot */
+	if (dir->hdr.pool_size < FITING_DIR_MAX_NODES)
+	{
+		idx = dir->hdr.pool_size++;
+		/* Primary slot: caller sets via fiting_put_node (or direct dir->pool) */
+		return idx;
+	}
+
+	/* 3. Need an overflow node */
+	{
+		int ov_idx = dir->hdr.pool_size - FITING_DIR_MAX_NODES;
+		int slot   = ov_idx % FITING_DIR_OVERFLOW_NODES;
+
+		if (slot == 0)
+			/* First slot on a new overflow page — allocate the page now */
+			alloc_new_overflow_dir_page(index, dir, meta, counts);
+
+		idx = dir->hdr.pool_size++;
+		return idx;
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * fiting_dir_free_node  [runtime]
+ *
+ * Return node_idx to the freelist.  Updates the node's .next to the old
+ * freelist head, then sets pool_freelist = node_idx.
+ * ----------------------------------------------------------------------- */
+void
+fiting_dir_free_node(FitingDirPageContent *dir, int node_idx, Relation index)
+{
+	FitingPageListNode fn;
+
+	Assert(node_idx >= 0 && node_idx < dir->hdr.pool_size);
+
+	fiting_get_node(index, dir, node_idx, &fn);
+	fn.page_no        = InvalidBlockNumber;
+	fn.page_start_key = 0;
+	fn.next           = dir->hdr.pool_freelist;
+	fiting_put_node(index, dir, node_idx, &fn);
+
+	dir->hdr.pool_freelist = node_idx;
+}
+
+/* -----------------------------------------------------------------------
+ * build_alloc_node  [static — build-time only]
+ *
+ * In-memory-only allocation used during fiting_build Phase 4.  Primary
+ * nodes go directly into dir->pool[]; overflow nodes go into the caller's
+ * *ovpool array (grown with repalloc as needed).  No disk I/O.
+ * ----------------------------------------------------------------------- */
+static int
+build_alloc_node(FitingDirPageContent *dir,
+				 FitingPageListNode **ovpool,
+				 int *ov_alloc)
+{
+	int idx;
+
+	if (dir->hdr.pool_size < FITING_DIR_MAX_NODES)
+	{
+		idx = dir->hdr.pool_size++;
+		dir->pool[idx].page_no        = InvalidBlockNumber;
+		dir->pool[idx].next           = -1;
+		dir->pool[idx].page_start_key = 0;
+		return idx;
+	}
+
+	/* Overflow */
+	{
+		int ov_idx = dir->hdr.pool_size - FITING_DIR_MAX_NODES;
+
+		if (ov_idx >= *ov_alloc)
+		{
+			*ov_alloc = (*ov_alloc == 0) ? 512 : *ov_alloc * 2;
+			if (*ovpool == NULL)
+				*ovpool = palloc(*ov_alloc * sizeof(FitingPageListNode));
+			else
+				*ovpool = repalloc(*ovpool,
+								   *ov_alloc * sizeof(FitingPageListNode));
+		}
+
+		(*ovpool)[ov_idx].page_no        = InvalidBlockNumber;
+		(*ovpool)[ov_idx].next           = -1;
+		(*ovpool)[ov_idx].page_start_key = 0;
+		idx = dir->hdr.pool_size++;
+		return idx;
+	}
+}
+
+/*
+ * BUILD_NODE(ni, dir, ovpool) — pointer to the FitingPageListNode for global
+ * index ni, using either the primary dir pool or the build-time overflow array.
+ */
+#define BUILD_NODE(ni, dir_ptr, ovpool) \
+	(((ni) < FITING_DIR_MAX_NODES) \
+	 ? &(dir_ptr)->pool[(ni)] \
+	 : &(ovpool)[(ni) - FITING_DIR_MAX_NODES])
+
+/* =======================================================================
  * fiting_build
  * ======================================================================= */
 IndexBuildResult *
 fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 {
-	FitingBuildState	bs;
-	IndexBuildResult   *result;
-	double				reltuples;
-	int64			   *keys;
-	FitingSegment	   *segs;
-	int					num_segs;
-	FitingMetaPageData	meta;
-	int32			   *counts;
+	FitingBuildState	 bs;
+	IndexBuildResult	*result;
+	double				 reltuples;
+	int64				*keys;
+	FitingSegment		*segs;
+	int					 num_segs;
+	FitingMetaPageData	 meta;
+	int32				*counts;
 	FitingDirPageContent *dir;
-	int					total_data_pages;
+	FitingDirPageContent *empty_dir;
+	int					 total_data_pages;
+	/* Build-time overflow pool (palloc'd; no disk I/O during Phase 4) */
+	FitingPageListNode	*build_overflow = NULL;
+	int					 build_ov_alloc = 0;
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "fiting_tree index \"%s\" already contains data",
@@ -452,15 +778,17 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	if (bs.ntups == 0)
 	{
 		memset(&meta, 0, sizeof(meta));
-		meta.magic         = FITING_MAGIC;
-		meta.max_error     = bs.max_error;
-		meta.total_tuples  = 0;
-		meta.num_segments  = 0;
-		meta.dir_blkno     = InvalidBlockNumber;
-		meta.freelist_head = InvalidBlockNumber;
+		meta.magic             = FITING_MAGIC;
+		meta.max_error         = bs.max_error;
+		meta.total_tuples      = 0;
+		meta.num_segments      = 0;
+		meta.dir_blkno         = InvalidBlockNumber;
+		meta.freelist_head     = InvalidBlockNumber;
 		meta.num_tracked_pages = 0;
-
-		FitingDirPageContent *empty_dir;
+		meta.buf_curr_page     = InvalidBlockNumber;
+		meta.buf_curr_slots    = 0;
+		meta.data_curr_page    = InvalidBlockNumber;
+		meta.data_curr_fill    = 0;
 
 		/* Block 0: meta */
 		write_page_to_index(index, FITING_F_META, NULL, 0);
@@ -475,6 +803,7 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		empty_dir->hdr.num_segments  = 0;
 		empty_dir->hdr.pool_size     = 0;
 		empty_dir->hdr.pool_freelist = -1;
+		empty_dir->hdr.next_page     = InvalidBlockNumber;
 		write_page_to_index(index, FITING_F_DIR, NULL, 0);
 		fiting_write_dir_page(index, empty_dir);
 		pfree(empty_dir);
@@ -539,6 +868,7 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		dir->hdr.num_segments  = nfinals;
 		dir->hdr.pool_size     = 0;
 		dir->hdr.pool_freelist = -1;
+		dir->hdr.next_page     = InvalidBlockNumber;
 
 		for (f = 0; f < nfinals; f++)
 		{
@@ -558,18 +888,20 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 			/* Allocate one node per page this entry spans */
 			for (p = first_pg; p <= last_pg; p++)
 			{
-				int		node_idx = fiting_dir_alloc_node(dir);
+				int		node_idx = build_alloc_node(dir, &build_overflow,
+													 &build_ov_alloc);
 				/* page_start_key: first key of THIS entry's data on page p */
 				int64	pfirst   = (p == first_pg)
 								 ? base
 								 : (int64) p * FITING_TUPLES_PER_PAGE;
+				FitingPageListNode *nd = BUILD_NODE(node_idx, dir, build_overflow);
 
-				dir->pool[node_idx].page_no        = FITING_DATA_START_BLKNO + p;
-				dir->pool[node_idx].next           = -1;
-				dir->pool[node_idx].page_start_key = bs.tuples[pfirst].key;
+				nd->page_no        = FITING_DATA_START_BLKNO + p;
+				nd->next           = -1;
+				nd->page_start_key = bs.tuples[pfirst].key;
 
 				if (prev_node >= 0)
-					dir->pool[prev_node].next = node_idx;
+					BUILD_NODE(prev_node, dir, build_overflow)->next = node_idx;
 				else
 					list_head = node_idx;
 				prev_node = node_idx;
@@ -586,9 +918,9 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 			dir->entries[f].seg_total_tuples  = (int32) sz;
 			dir->entries[f].seg_info          = 0;
 			FitingSegSetType(&dir->entries[f], fe->seg_type);
-			dir->entries[f].buf_blkno         = InvalidBlockNumber;
-			dir->entries[f].num_buffer_tuples = 0;
-			dir->entries[f].start_slot        = start_slot;
+			dir->entries[f].buf_blkno  = InvalidBlockNumber;
+			dir->entries[f].buf_info   = 0;
+			dir->entries[f].start_slot = start_slot;
 		}
 
 		num_segs = nfinals;		/* update so meta.num_segments is set correctly */
@@ -604,6 +936,27 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	meta.dir_blkno         = FITING_DIR_BLKNO;
 	meta.freelist_head     = InvalidBlockNumber;
 	meta.num_tracked_pages = total_data_pages;
+	meta.buf_curr_page     = InvalidBlockNumber;
+	meta.buf_curr_slots    = 0;
+	/*
+	 * data_curr_page / data_curr_fill: track the last data page so that
+	 * subsequent inserts → resegments can append to it rather than always
+	 * allocating a fresh page.
+	 */
+	{
+		int64 last_fill = bs.ntups % FITING_TUPLES_PER_PAGE;
+
+		if (last_fill == 0 || total_data_pages == 0)
+		{
+			meta.data_curr_page = InvalidBlockNumber;
+			meta.data_curr_fill = 0;
+		}
+		else
+		{
+			meta.data_curr_page = FITING_DATA_START_BLKNO + total_data_pages - 1;
+			meta.data_curr_fill = (int32) last_fill;
+		}
+	}
 
 	/* Block 0: placeholder meta (extend file to correct block) */
 	write_page_to_index(index, FITING_F_META, NULL, 0);
@@ -627,6 +980,94 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 								(size_t) batch * sizeof(FitingLeafTuple));
 			written += batch;
 		}
+	}
+
+	/*
+	 * Flush build-time overflow nodes to disk.
+	 *
+	 * During Phase 4 we kept overflow nodes (pool_size > FITING_DIR_MAX_NODES)
+	 * in the palloc'd build_overflow array to avoid disk I/O before data pages
+	 * existed.  Now that data pages have been written, we extend the relation
+	 * further with overflow dir pages, copy nodes into them, link the chain,
+	 * and record dir->hdr.next_page so fiting_write_dir_page persists it.
+	 */
+	if (dir->hdr.pool_size > FITING_DIR_MAX_NODES && build_overflow != NULL)
+	{
+		int ov_count = dir->hdr.pool_size - FITING_DIR_MAX_NODES;
+		int ov_pages = (ov_count + FITING_DIR_OVERFLOW_NODES - 1)
+					   / FITING_DIR_OVERFLOW_NODES;
+		BlockNumber *ov_blknos = palloc(ov_pages * sizeof(BlockNumber));
+		int op;
+
+		/* First pass: write each overflow page with its node data */
+		for (op = 0; op < ov_pages; op++)
+		{
+			int				ov_start = op * FITING_DIR_OVERFLOW_NODES;
+			int				ov_n     = ov_count - ov_start;
+			Buffer			buf;
+			Page			page;
+			GenericXLogState *xstate;
+			FitingDirOverflowHeader *ohdr;
+			FitingPageListNode		*pool_area;
+			BlockNumber		blkno;
+			int				cidx;
+
+			if (ov_n > FITING_DIR_OVERFLOW_NODES)
+				ov_n = FITING_DIR_OVERFLOW_NODES;
+
+			buf   = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+									  EB_LOCK_FIRST);
+			blkno = BufferGetBlockNumber(buf);
+			ov_blknos[op] = blkno;
+
+			/* Track in ref-count array */
+			cidx = (int) (blkno - FITING_DATA_START_BLKNO);
+			if (cidx >= 0 && cidx < FITING_META_MAX_PAGES)
+			{
+				counts[cidx] = 1;
+				if (cidx >= meta.num_tracked_pages)
+					meta.num_tracked_pages = cidx + 1;
+			}
+
+			xstate    = GenericXLogStart(index);
+			page      = GenericXLogRegisterBuffer(xstate, buf,
+												   GENERIC_XLOG_FULL_IMAGE);
+			FitingInitPage(page, FITING_F_DIR);
+			ohdr            = (FitingDirOverflowHeader *) PageGetContents(page);
+			ohdr->next_page = InvalidBlockNumber;	/* linked in second pass */
+			ohdr->pad       = 0;
+			pool_area       = (FitingPageListNode *)(ohdr + 1);
+			memset(pool_area, 0,
+				   FITING_DIR_OVERFLOW_NODES * sizeof(FitingPageListNode));
+			memcpy(pool_area, build_overflow + ov_start,
+				   ov_n * sizeof(FitingPageListNode));
+			((PageHeader) page)->pd_lower +=
+				(int) (sizeof(FitingDirOverflowHeader) +
+					   FITING_DIR_OVERFLOW_NODES * sizeof(FitingPageListNode));
+			GenericXLogFinish(xstate);
+			UnlockReleaseBuffer(buf);
+		}
+
+		/* Second pass: link the chain and update dir->hdr.next_page */
+		dir->hdr.next_page = ov_blknos[0];
+		for (op = 0; op < ov_pages - 1; op++)
+		{
+			Buffer			 buf;
+			Page			 page;
+			GenericXLogState *xstate;
+
+			buf    = ReadBuffer(index, ov_blknos[op]);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			xstate = GenericXLogStart(index);
+			page   = GenericXLogRegisterBuffer(xstate, buf, 0);
+			((FitingDirOverflowHeader *) PageGetContents(page))->next_page =
+				ov_blknos[op + 1];
+			GenericXLogFinish(xstate);
+			UnlockReleaseBuffer(buf);
+		}
+
+		pfree(ov_blknos);
+		pfree(build_overflow);
 	}
 
 	/* Overwrite block 0 with real meta + counts */
@@ -674,6 +1115,10 @@ fiting_buildempty(Relation index)
 	meta.dir_blkno         = InvalidBlockNumber;
 	meta.freelist_head     = InvalidBlockNumber;
 	meta.num_tracked_pages = 0;
+	meta.buf_curr_page     = InvalidBlockNumber;
+	meta.buf_curr_slots    = 0;
+	meta.data_curr_page    = InvalidBlockNumber;
+	meta.data_curr_fill    = 0;
 
 	memcpy(PageGetContents(page), &meta, sizeof(meta));
 	((PageHeader) page)->pd_lower += sizeof(meta);
@@ -774,6 +1219,15 @@ fiting_free_page(Relation index, FitingMetaPageData *meta, int32 *counts,
 			return;		/* page still referenced by another segment */
 	}
 
+	/*
+	 * If the page being freed was the current open data or buffer page,
+	 * invalidate those pointers so we don't try to append to a freed page.
+	 */
+	if (blkno == meta->buf_curr_page)
+		meta->buf_curr_page = InvalidBlockNumber;
+	if (blkno == meta->data_curr_page)
+		meta->data_curr_page = InvalidBlockNumber;
+
 	/* Actually free the page */
 	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -792,72 +1246,77 @@ fiting_free_page(Relation index, FitingMetaPageData *meta, int32 *counts,
 }
 
 /* -----------------------------------------------------------------------
- * fiting_write_seg_pages
+ * fiting_alloc_buf_slot
  *
- * Write tuples[0..ntups) to freshly allocated pages for entry.
- * Allocates each page via fiting_alloc_page (freelist-first), builds
- * the linked list of FitingPageListNode records in dir->pool, and sets
- * entry->page_list_head and entry->start_slot = 0.
+ * Assign a 32-tuple buffer slot to seg.  Up to FITING_BUF_SLOTS_PER_PAGE
+ * (15) segments share one 8 kB buffer page.  When the current shared page
+ * is full (or does not yet exist), a new page is allocated via
+ * fiting_alloc_page, zeroed, and registered as meta->buf_curr_page.
  *
- * Caller must write meta + counts + dir back to disk afterward.
+ * On return, seg->buf_blkno and seg->buf_info are set; the slot count
+ * within buf_info is 0 (no tuples yet).  meta and counts are updated in
+ * memory; caller must persist them.
  * ----------------------------------------------------------------------- */
-static void
-fiting_write_seg_pages(Relation index,
-					   FitingMetaPageData *meta,
-					   int32 *counts,
-					   FitingDirPageContent *dir,
-					   FitingDirEntry *entry,
-					   FitingLeafTuple *tuples, int64 ntups)
+void
+fiting_alloc_buf_slot(Relation index,
+					  FitingMetaPageData *meta,
+					  int32 *counts,
+					  FitingDirEntry *seg)
 {
-	int64	written  = 0;
-	int		prev_node = -1;
+	int			slot_idx;
+	BlockNumber	blkno;
 
-	entry->start_slot       = 0;
-	entry->page_list_head   = -1;
-
-	while (written < ntups)
+	if (meta->buf_curr_page == InvalidBlockNumber ||
+		meta->buf_curr_slots >= FITING_BUF_SLOTS_PER_PAGE)
 	{
-		int64				batch = ntups - written;
-		BlockNumber			blkno;
-		Buffer				buf;
-		Page				page;
-		GenericXLogState   *xstate;
-		int					node_idx;
+		/*
+		 * Current buffer page is full or does not exist.
+		 * Allocate a fresh page and initialise all slots to zero.
+		 */
+		Buffer			   buf;
+		Page			   page;
+		GenericXLogState  *xstate;
 
-		if (batch > FITING_TUPLES_PER_PAGE)
-			batch = FITING_TUPLES_PER_PAGE;
-
-		/* Allocate a page (freelist-first, extend only if needed) */
 		blkno = fiting_alloc_page(index, meta, counts);
 
-		/* Write tuples */
 		buf    = ReadBuffer(index, blkno);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		xstate = GenericXLogStart(index);
 		page   = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
 
-		FitingInitPage(page, FITING_F_LEAF);
-		memcpy(PageGetContents(page), tuples + written,
-			   (size_t) batch * sizeof(FitingLeafTuple));
-		((PageHeader) page)->pd_lower += (int) batch * sizeof(FitingLeafTuple);
+		FitingInitPage(page, FITING_F_BUF);
+		/* Zero the entire slot area so stale data cannot leak */
+		memset(PageGetContents(page), 0,
+			   FITING_BUF_SLOTS_PER_PAGE *
+			   FITING_BUF_TUPLES_PER_SEG * sizeof(FitingLeafTuple));
+		((PageHeader) page)->pd_lower +=
+			FITING_BUF_SLOTS_PER_PAGE *
+			FITING_BUF_TUPLES_PER_SEG * sizeof(FitingLeafTuple);
 
 		GenericXLogFinish(xstate);
 		UnlockReleaseBuffer(buf);
 
-		/* Append a node to this segment's linked list */
-		node_idx = fiting_dir_alloc_node(dir);
-		dir->pool[node_idx].page_no        = blkno;
-		dir->pool[node_idx].next           = -1;
-		dir->pool[node_idx].page_start_key = tuples[written].key;
-
-		if (prev_node >= 0)
-			dir->pool[prev_node].next = node_idx;
-		else
-			entry->page_list_head = node_idx;
-		prev_node = node_idx;
-
-		written += batch;
+		meta->buf_curr_page  = blkno;
+		meta->buf_curr_slots = 1;
+		slot_idx             = 0;
 	}
+	else
+	{
+		/* Reuse the current page — bump its ref-count for the new segment */
+		int cidx;
+
+		blkno    = meta->buf_curr_page;
+		slot_idx = meta->buf_curr_slots;
+
+		cidx = (int) (blkno - FITING_DATA_START_BLKNO);
+		if (cidx >= 0 && cidx < FITING_META_MAX_PAGES)
+			counts[cidx]++;
+
+		meta->buf_curr_slots++;
+	}
+
+	seg->buf_blkno = blkno;
+	FitingBufSetInfo(seg, slot_idx, 0);
 }
 
 /* -----------------------------------------------------------------------
@@ -866,10 +1325,13 @@ fiting_write_seg_pages(Relation index,
  * Re-segment dir->entries[seg_idx]:
  *   1. Collect live (non-deleted) tuples from the segment's data pages
  *      by walking its page linked list.
- *   2. Merge with buffer-page tuples (always live).
+ *   2. Merge with buffer-slot tuples (slot-offset aware, always live).
  *   3. Run ShrinkingCone on the merged sorted array.
- *   4. FREE OLD PAGES FIRST (ref-count aware) — freed pages go to freelist.
- *   5. Write new segment pages via fiting_write_seg_pages (freelist-first).
+ *   4. Collect old page block numbers; free dir-pool nodes.
+ *      Release old buffer slot (ref-count decrement).
+ *   5. Write new segment pages using in-place reuse: overwrite old pages
+ *      first (full page, count set to 1), then append to data_curr_page,
+ *      then allocate from freelist.  Free any surplus old pages afterward.
  *   6. Splice new FitingDirEntry records into dir->entries[]; update meta.
  *   7. Write directory and meta+counts pages.
  *
@@ -885,7 +1347,7 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 	int64				live_count   = 0;
 	int64				dead_seen    = 0;
 	FitingLeafTuple    *buf_data    = NULL;
-	int32				num_buf      = old_seg->num_buffer_tuples;
+	int32				num_buf      = FitingBufCount(old_seg);
 	FitingLeafTuple    *merged;
 	int64				merged_count;
 	int64			   *keys;
@@ -895,6 +1357,8 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 	FitingDirEntry	   *new_entries;
 	int					old_page_list_head;
 	BlockNumber			old_buf_blkno;
+	BlockNumber		   *old_page_list = NULL;
+	int					num_old_pages  = 0;
 
 	/* ---- Step 1: collect live tuples from data pages (walk node list) -- */
 	live_data = palloc((old_seg->seg_total_tuples + num_buf)
@@ -906,6 +1370,8 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 
 		while (node_idx >= 0)
 		{
+			FitingPageListNode nd;
+			int				next_node_idx;
 			Buffer			buf;
 			Page			page;
 			FitingLeafTuple *page_tuples;
@@ -913,7 +1379,10 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 			int				start_slot;
 			int				s;
 
-			buf        = ReadBuffer(index, dir->pool[node_idx].page_no);
+			fiting_get_node(index, dir, node_idx, &nd);
+			next_node_idx = nd.next;
+
+			buf        = ReadBuffer(index, nd.page_no);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page       = BufferGetPage(buf);
 			page_tuples = FitingPageGetLeaf(page);
@@ -941,7 +1410,7 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 			if (live_count + dead_seen >= old_seg->seg_total_tuples)
 				break;
 
-			node_idx = dir->pool[node_idx].next;
+			node_idx = next_node_idx;
 			page_local_num++;
 		}
 	}
@@ -957,7 +1426,10 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 		buf = ReadBuffer(index, old_seg->buf_blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		memcpy(buf_data, FitingPageGetLeaf(page),
+		/* Read from the correct slot offset within the shared buffer page */
+		memcpy(buf_data,
+			   FitingPageGetLeaf(page) +
+			   FitingBufSlot(old_seg) * FITING_BUF_TUPLES_PER_SEG,
 			   num_buf * sizeof(FitingLeafTuple));
 		UnlockReleaseBuffer(buf);
 	}
@@ -991,31 +1463,76 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 	old_page_list_head = old_seg->page_list_head;
 	old_buf_blkno      = old_seg->buf_blkno;
 
-	/* ---- Step 4: FREE OLD PAGES FIRST -------------------------------- *
-	 *                                                                      *
-	 * Free before allocating new pages so freed blocks re-enter the        *
-	 * freelist and can be reused immediately without file extension.        *
-	 * fiting_free_page() uses ref-counts: shared pages (count>1) are       *
-	 * only decremented, not wiped, protecting the neighbour segment's data. */
-
-	if (merged_count == 0)
+	/*
+	 * ---- Step 4: collect old data pages into a reuse pool ---------------
+	 *
+	 * We walk the old segment's linked list and gather every page block
+	 * number.  Dir-pool nodes are freed immediately (reclaimed for new
+	 * segments).  The actual disk pages are NOT freed here — we will
+	 * overwrite them in-place during Step 5 (full reuse), and only call
+	 * fiting_free_page for pages that end up surplus after the write.
+	 *
+	 * For shared boundary pages (counts > 1, set during the initial bulk
+	 * build): we still overwrite them fully and set counts = 1 to take
+	 * exclusive ownership.  The neighbouring segment's reference to that
+	 * page becomes stale; it will be corrected when that segment is itself
+	 * resegmented.
+	 */
 	{
-		/*
-		 * Entire segment dead + buffer empty.  Remove segment from directory
-		 * and free all its pages.
-		 */
-		int node_idx = old_page_list_head;
+		int  node_idx  = old_page_list_head;
+		int  old_count = 0;
 
+		/* Count pages first */
 		while (node_idx >= 0)
 		{
-			int next = dir->pool[node_idx].next;
+			FitingPageListNode nd;
 
-			fiting_free_page(index, meta, counts, dir->pool[node_idx].page_no);
-			fiting_dir_free_node(dir, node_idx);
+			fiting_get_node(index, dir, node_idx, &nd);
+			old_count++;
+			node_idx = nd.next;
+		}
+
+		old_page_list = palloc(old_count > 0
+							   ? old_count * sizeof(BlockNumber)
+							   : sizeof(BlockNumber));
+		num_old_pages = 0;
+
+		node_idx = old_page_list_head;
+		while (node_idx >= 0)
+		{
+			FitingPageListNode nd;
+			int next;
+
+			fiting_get_node(index, dir, node_idx, &nd);
+			next = nd.next;
+			old_page_list[num_old_pages++] = nd.page_no;
+
+			/* Inline free: push onto freelist */
+			nd.page_no        = InvalidBlockNumber;
+			nd.page_start_key = 0;
+			nd.next           = dir->hdr.pool_freelist;
+			fiting_put_node(index, dir, node_idx, &nd);
+			dir->hdr.pool_freelist = node_idx;
+
 			node_idx = next;
 		}
-		if (old_buf_blkno != InvalidBlockNumber)
-			fiting_free_page(index, meta, counts, old_buf_blkno);
+	}
+
+	/* Release old buffer slot (ref-count decrement only for shared page) */
+	if (old_buf_blkno != InvalidBlockNumber)
+	{
+		fiting_free_page(index, meta, counts, old_buf_blkno);
+		old_seg->buf_info = 0;
+	}
+
+	/* Segment fully dead + no live buffer — remove from directory */
+	if (merged_count == 0)
+	{
+		int ri;
+
+		for (ri = 0; ri < num_old_pages; ri++)
+			fiting_free_page(index, meta, counts, old_page_list[ri]);
+		pfree(old_page_list);
 
 		meta->num_segments--;
 		dir->hdr.num_segments--;
@@ -1028,24 +1545,6 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 		pfree(merged);
 		goto write_dir_meta;
 	}
-
-	/* Free old data pages */
-	{
-		int node_idx = old_page_list_head;
-
-		while (node_idx >= 0)
-		{
-			int next = dir->pool[node_idx].next;
-
-			fiting_free_page(index, meta, counts, dir->pool[node_idx].page_no);
-			fiting_dir_free_node(dir, node_idx);
-			node_idx = next;
-		}
-	}
-
-	/* Free old buffer page */
-	if (old_buf_blkno != InvalidBlockNumber)
-		fiting_free_page(index, meta, counts, old_buf_blkno);
 
 	/* Adjust total live count for tombstones that were purged */
 	meta->total_tuples -= dead_seen;
@@ -1070,6 +1569,7 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 		FinalEntry *finals;
 		int			nfinals;
 		int			f;
+		int			reuse_idx;		/* next old page to reuse in-place */
 
 		for (int i = 0; i < new_num_segs; i++)
 			seg_sizes[i] = (i + 1 < new_num_segs)
@@ -1088,31 +1588,196 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 				 "(max %d). Increase max_error.",
 				 total_new_capacity, FITING_DIR_MAX_SEGS);
 
-		/* ---- Step 5: WRITE NEW SEGMENT PAGES (freelist-first) ---------- */
+		/* ---- Step 5: write new segment pages (in-place reuse first) ---- *
+		 *                                                                    *
+		 * Priority order for each new page needed:                          *
+		 *   1. Reuse an old page in-place (full overwrite, count set to 1). *
+		 *   2. Append to meta->data_curr_page if it has capacity.           *
+		 *   3. Allocate a fresh page from the freelist / extend the file.   *
+		 *                                                                    *
+		 * After writing all new segments, leftover old pages are freed.     */
 		new_entries = palloc0(nfinals * sizeof(FitingDirEntry));
+		reuse_idx   = 0;
 
 		for (f = 0; f < nfinals; f++)
 		{
 			FinalEntry *fe        = &finals[f];
 			int64		seg_start = new_segs[fe->from_seg].base_rank;
 			int64		seg_size  = fe->total_tuples;
+			int64		written   = 0;
+			int			prev_node = -1;
 
-			new_entries[f].start_key         = new_segs[fe->from_seg].start_key;
-			new_entries[f].slope             = (fe->seg_type == FITING_SEG_TYPE_FITING)
-											   ? new_segs[fe->from_seg].slope : 0.0;
-			new_entries[f].seg_total_tuples  = (int32) seg_size;
-			new_entries[f].seg_info          = 0;
+			new_entries[f].start_key        = new_segs[fe->from_seg].start_key;
+			new_entries[f].slope            = (fe->seg_type == FITING_SEG_TYPE_FITING)
+											  ? new_segs[fe->from_seg].slope : 0.0;
+			new_entries[f].seg_total_tuples = (int32) seg_size;
+			new_entries[f].seg_info         = 0;
 			FitingSegSetType(&new_entries[f], fe->seg_type);
-			new_entries[f].buf_blkno         = InvalidBlockNumber;
-			new_entries[f].num_buffer_tuples = 0;
+			new_entries[f].buf_blkno        = InvalidBlockNumber;
+			new_entries[f].buf_info         = 0;
+			new_entries[f].start_slot       = 0;
+			new_entries[f].page_list_head   = -1;
 
-			fiting_write_seg_pages(index, meta, counts, dir,
-								   &new_entries[f],
-								   merged + seg_start, seg_size);
+			while (written < seg_size)
+			{
+				int64				batch          = seg_size - written;
+				BlockNumber			blkno;
+				int					page_start_slot = 0;
+				Buffer				wbuf;
+				Page				wpage;
+				GenericXLogState   *xstate;
+				int					node_idx;
+
+				if (batch > FITING_TUPLES_PER_PAGE)
+					batch = FITING_TUPLES_PER_PAGE;
+
+				if (reuse_idx < num_old_pages)
+				{
+					/*
+					 * Reuse an old page in-place.  Take exclusive ownership
+					 * (set count = 1) regardless of whether it was shared.
+					 */
+					int cidx;
+
+					blkno = old_page_list[reuse_idx++];
+					cidx  = (int) (blkno - FITING_DATA_START_BLKNO);
+					if (cidx >= 0 && cidx < FITING_META_MAX_PAGES)
+						counts[cidx] = 1;
+
+					page_start_slot = 0;
+
+					wbuf   = ReadBuffer(index, blkno);
+					LockBuffer(wbuf, BUFFER_LOCK_EXCLUSIVE);
+					xstate = GenericXLogStart(index);
+					wpage  = GenericXLogRegisterBuffer(xstate, wbuf,
+													   GENERIC_XLOG_FULL_IMAGE);
+					FitingInitPage(wpage, FITING_F_LEAF);
+					memcpy(PageGetContents(wpage),
+						   merged + seg_start + written,
+						   (size_t) batch * sizeof(FitingLeafTuple));
+					((PageHeader) wpage)->pd_lower +=
+						(int) batch * sizeof(FitingLeafTuple);
+					GenericXLogFinish(xstate);
+					UnlockReleaseBuffer(wbuf);
+				}
+				else if (meta->data_curr_page != InvalidBlockNumber &&
+						 meta->data_curr_fill > 0 &&
+						 meta->data_curr_fill < FITING_TUPLES_PER_PAGE)
+				{
+					/*
+					 * Append to the current partial data page.
+					 * Limit batch to what fits in the remaining slots.
+					 */
+					int avail = FITING_TUPLES_PER_PAGE - meta->data_curr_fill;
+					int cidx;
+
+					if (batch > avail)
+						batch = avail;
+
+					blkno           = meta->data_curr_page;
+					page_start_slot = meta->data_curr_fill;
+
+					cidx = (int) (blkno - FITING_DATA_START_BLKNO);
+					if (cidx >= 0 && cidx < FITING_META_MAX_PAGES)
+						counts[cidx]++;	/* one more segment references this page */
+
+					/*
+					 * Use flag 0 (keep existing page content) so we don't
+					 * clobber data written by the previous segment.
+					 */
+					wbuf   = ReadBuffer(index, blkno);
+					LockBuffer(wbuf, BUFFER_LOCK_EXCLUSIVE);
+					xstate = GenericXLogStart(index);
+					wpage  = GenericXLogRegisterBuffer(xstate, wbuf, 0);
+					memcpy((char *) PageGetContents(wpage) +
+						   page_start_slot * sizeof(FitingLeafTuple),
+						   merged + seg_start + written,
+						   (size_t) batch * sizeof(FitingLeafTuple));
+					((PageHeader) wpage)->pd_lower =
+						SizeOfPageHeaderData +
+						(page_start_slot + (int) batch) * sizeof(FitingLeafTuple);
+					GenericXLogFinish(xstate);
+					UnlockReleaseBuffer(wbuf);
+				}
+				else
+				{
+					/* Allocate a fresh page from the freelist */
+					blkno           = fiting_alloc_page(index, meta, counts);
+					page_start_slot = 0;
+
+					wbuf   = ReadBuffer(index, blkno);
+					LockBuffer(wbuf, BUFFER_LOCK_EXCLUSIVE);
+					xstate = GenericXLogStart(index);
+					wpage  = GenericXLogRegisterBuffer(xstate, wbuf,
+													   GENERIC_XLOG_FULL_IMAGE);
+					FitingInitPage(wpage, FITING_F_LEAF);
+					memcpy(PageGetContents(wpage),
+						   merged + seg_start + written,
+						   (size_t) batch * sizeof(FitingLeafTuple));
+					((PageHeader) wpage)->pd_lower +=
+						(int) batch * sizeof(FitingLeafTuple);
+					GenericXLogFinish(xstate);
+					UnlockReleaseBuffer(wbuf);
+				}
+
+				/* Update data_curr_page / data_curr_fill */
+				{
+					int new_fill = page_start_slot + (int) batch;
+
+					if (new_fill >= FITING_TUPLES_PER_PAGE)
+					{
+						if (blkno == meta->data_curr_page)
+						{
+							meta->data_curr_page = InvalidBlockNumber;
+							meta->data_curr_fill = 0;
+						}
+					}
+					else
+					{
+						meta->data_curr_page = blkno;
+						meta->data_curr_fill = new_fill;
+					}
+				}
+
+				/* Record start_slot for the first page of this segment */
+				if (written == 0)
+					new_entries[f].start_slot = page_start_slot;
+
+				/* Append a node to this segment's linked list */
+				{
+					FitingPageListNode new_nd;
+
+					new_nd.page_no        = blkno;
+					new_nd.next           = -1;
+					new_nd.page_start_key =
+						merged[seg_start + written].key;
+
+					node_idx = fiting_dir_alloc_node(dir, index, meta, counts);
+					fiting_put_node(index, dir, node_idx, &new_nd);
+
+					if (prev_node >= 0)
+					{
+						FitingPageListNode prev_nd;
+
+						fiting_get_node(index, dir, prev_node, &prev_nd);
+						prev_nd.next = node_idx;
+						fiting_put_node(index, dir, prev_node, &prev_nd);
+					}
+					else
+						new_entries[f].page_list_head = node_idx;
+					prev_node = node_idx;
+				}
+
+				written += batch;
+			}
 		}
 
-		pfree(finals);
+		/* Free any old pages that were not needed for the new segments */
+		for (; reuse_idx < num_old_pages; reuse_idx++)
+			fiting_free_page(index, meta, counts, old_page_list[reuse_idx]);
+		pfree(old_page_list);
 
+		pfree(finals);
 		pfree(merged);
 		pfree(new_segs);
 

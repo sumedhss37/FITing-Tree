@@ -12,10 +12,9 @@
  *   the minimum number of piecewise-linear segments that bound every key's
  *   predicted rank within ±max_error of its true rank.
  *
- * Node-pool helpers:
- *   fiting_dir_alloc_node / fiting_dir_free_node operate on the in-memory
- *   FitingDirPageContent copy passed by the caller.  The caller is
- *   responsible for writing the modified dir copy back to disk.
+ * Node-pool helpers (fiting_dir_alloc_node / fiting_dir_free_node /
+ * fiting_get_node / fiting_put_node) now live in ft_build.c so they can
+ * access the relation for overflow dir page I/O.
  *
  *-------------------------------------------------------------------------
  */
@@ -45,55 +44,6 @@ FitingInitPage(Page page, uint16 flags)
 	opaque = FitingPageGetOpaque(page);
 	opaque->flags   = flags;
 	opaque->page_id = FITING_PAGE_ID;
-}
-
-/* -----------------------------------------------------------------------
- * fiting_dir_alloc_node
- *
- * Allocate a free node from the pool in dir.  Returns the node index.
- * Pops from pool_freelist first; otherwise claims the next unused slot.
- * Caller must write the modified dir copy back to disk.
- * ----------------------------------------------------------------------- */
-int
-fiting_dir_alloc_node(FitingDirPageContent *dir)
-{
-	int		idx;
-
-	if (dir->hdr.pool_freelist >= 0)
-	{
-		/* Pop head of free list */
-		idx = dir->hdr.pool_freelist;
-		dir->hdr.pool_freelist = dir->pool[idx].next;
-		dir->pool[idx].page_no = InvalidBlockNumber;
-		dir->pool[idx].next    = -1;
-		return idx;
-	}
-
-	if (dir->hdr.pool_size >= FITING_DIR_MAX_NODES)
-		elog(ERROR,
-			 "fiting_tree: directory node pool exhausted (max %d nodes). "
-			 "Rebuild the index.",
-			 FITING_DIR_MAX_NODES);
-
-	idx = dir->hdr.pool_size++;
-	dir->pool[idx].page_no = InvalidBlockNumber;
-	dir->pool[idx].next    = -1;
-	return idx;
-}
-
-/* -----------------------------------------------------------------------
- * fiting_dir_free_node
- *
- * Return node_idx to the free list in dir.
- * Caller must write the modified dir copy back to disk.
- * ----------------------------------------------------------------------- */
-void
-fiting_dir_free_node(FitingDirPageContent *dir, int node_idx)
-{
-	Assert(node_idx >= 0 && node_idx < FITING_DIR_MAX_NODES);
-	dir->pool[node_idx].page_no = InvalidBlockNumber;
-	dir->pool[node_idx].next    = dir->hdr.pool_freelist;
-	dir->hdr.pool_freelist      = node_idx;
 }
 
 /* -----------------------------------------------------------------------

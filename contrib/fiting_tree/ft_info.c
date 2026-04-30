@@ -87,8 +87,11 @@ fiting_index_info(PG_FUNCTION_ARGS)
 		/* Count linked-list data pages for this segment */
 		while (node_idx >= 0)
 		{
+			FitingPageListNode nd;
+
 			npages++;
-			node_idx = dir->pool[node_idx].next;
+			fiting_get_node(index, dir, node_idx, &nd);
+			node_idx = nd.next;
 		}
 
 		values[0] = Int32GetDatum(i);
@@ -98,7 +101,7 @@ fiting_index_info(PG_FUNCTION_ARGS)
 		values[3] = Int32GetDatum(seg->seg_total_tuples);
 		values[4] = Int32GetDatum(FitingSegNumDeleted(seg));
 		values[5] = Int32GetDatum(npages);
-		values[6] = Int32GetDatum(seg->num_buffer_tuples);
+		values[6] = Int32GetDatum(FitingBufCount(seg));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

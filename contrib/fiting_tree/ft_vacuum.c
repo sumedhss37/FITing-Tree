@@ -71,7 +71,9 @@ fiting_bulkdelete(IndexVacuumInfo *info,
 		/* ---- a) Mark dead entries in data pages (walk linked list) ------- */
 		while (node_idx >= 0)
 		{
-			BlockNumber			blkno = dir->pool[node_idx].page_no;
+			FitingPageListNode	nd;
+			int					next_node_idx;
+			BlockNumber			blkno;
 			Buffer				dbuf;
 			Page				dpage;
 			GenericXLogState   *xstate;
@@ -80,6 +82,10 @@ fiting_bulkdelete(IndexVacuumInfo *info,
 			int					start_slot, end_slot;
 			int					s;
 			bool				page_dirty = false;
+
+			fiting_get_node(index, dir, node_idx, &nd);
+			blkno         = nd.page_no;
+			next_node_idx = nd.next;
 
 			dbuf   = ReadBuffer(index, blkno);
 			LockBuffer(dbuf, BUFFER_LOCK_SHARE);
@@ -147,70 +153,93 @@ fiting_bulkdelete(IndexVacuumInfo *info,
 				UnlockReleaseBuffer(dbuf);
 			}
 
-			node_idx = dir->pool[node_idx].next;
+			node_idx = next_node_idx;
 			page_local_num++;
 		}
 
-		/* ---- b) Compact buffer page ------------------------------------- */
-		if (seg->buf_blkno != InvalidBlockNumber && seg->num_buffer_tuples > 0)
+		/* ---- b) Compact buffer slot ------------------------------------- */
 		{
-			Buffer			bbuf;
-			Page			bpage;
-			FitingLeafTuple *src;
-			FitingLeafTuple *compacted;
-			int				 n = seg->num_buffer_tuples;
-			int				 j, new_n = 0;
+			int32 num_buf = FitingBufCount(seg);
+			int   slot    = FitingBufSlot(seg);
 
-			bbuf  = ReadBuffer(index, seg->buf_blkno);
-			LockBuffer(bbuf, BUFFER_LOCK_SHARE);
-			bpage = BufferGetPage(bbuf);
-			src   = FitingPageGetLeaf(bpage);
-
-			compacted = palloc(n * sizeof(FitingLeafTuple));
-			for (j = 0; j < n; j++)
+			if (seg->buf_blkno != InvalidBlockNumber && num_buf > 0)
 			{
-				if (callback(&src[j].tid, callback_state))
+				Buffer			bbuf;
+				Page			bpage;
+				FitingLeafTuple *src;
+				FitingLeafTuple  compacted[FITING_BUF_TUPLES_PER_SEG];
+				int				 j, new_n = 0;
+
+				bbuf  = ReadBuffer(index, seg->buf_blkno);
+				LockBuffer(bbuf, BUFFER_LOCK_SHARE);
+				bpage = BufferGetPage(bbuf);
+
+				/*
+				 * Read only this segment's slot — other segments' slots sit
+				 * at different offsets on the same shared page.
+				 */
+				src = FitingPageGetLeaf(bpage) +
+					  slot * FITING_BUF_TUPLES_PER_SEG;
+
+				for (j = 0; j < num_buf; j++)
 				{
-					stats->tuples_removed++;
-					meta.total_tuples--;
+					if (callback(&src[j].tid, callback_state))
+					{
+						stats->tuples_removed++;
+						meta.total_tuples--;
+					}
+					else
+					{
+						compacted[new_n++] = src[j];
+					}
 				}
-				else
-				{
-					compacted[new_n++] = src[j];
-				}
-			}
-			UnlockReleaseBuffer(bbuf);
-
-			if (new_n == 0)
-			{
-				/* Buffer empty — free the page (count-aware) */
-				fiting_free_page(index, &meta, counts, seg->buf_blkno);
-				seg->buf_blkno          = InvalidBlockNumber;
-				seg->num_buffer_tuples  = 0;
-			}
-			else if (new_n < n)
-			{
-				/* Write compacted buffer back */
-				GenericXLogState *xstate;
-
-				bbuf   = ReadBuffer(index, seg->buf_blkno);
-				LockBuffer(bbuf, BUFFER_LOCK_EXCLUSIVE);
-				xstate = GenericXLogStart(index);
-				bpage  = GenericXLogRegisterBuffer(xstate, bbuf,
-												   GENERIC_XLOG_FULL_IMAGE);
-
-				FitingInitPage(bpage, FITING_F_LEAF);
-				memcpy(PageGetContents(bpage), compacted,
-					   new_n * sizeof(FitingLeafTuple));
-				((PageHeader) bpage)->pd_lower += new_n * sizeof(FitingLeafTuple);
-
-				GenericXLogFinish(xstate);
 				UnlockReleaseBuffer(bbuf);
 
-				seg->num_buffer_tuples = new_n;
-			}
+				if (new_n == 0)
+				{
+					/*
+					 * Slot is empty.  Decrement the shared page's ref-count;
+					 * fiting_free_page physically frees it when count hits 0.
+					 * No need to zero our slot: once buf_blkno is cleared the
+					 * slot is never read again.
+					 */
+					fiting_free_page(index, &meta, counts, seg->buf_blkno);
+					seg->buf_blkno = InvalidBlockNumber;
+					seg->buf_info  = 0;
+				}
+				else if (new_n < num_buf)
+				{
+					/*
+					 * Write compacted data back into just our slot.  Use flag
+					 * 0 (keep existing) so other segments' slots are untouched.
+					 * Zero trailing positions within the slot so stale TIDs
+					 * cannot be read if the count field is later incremented.
+					 */
+					GenericXLogState *xstate;
+					char			 *slot_ptr;
 
-			pfree(compacted);
+					bbuf   = ReadBuffer(index, seg->buf_blkno);
+					LockBuffer(bbuf, BUFFER_LOCK_EXCLUSIVE);
+					xstate = GenericXLogStart(index);
+					bpage  = GenericXLogRegisterBuffer(xstate, bbuf, 0);
+
+					slot_ptr = (char *) PageGetContents(bpage) +
+							   slot * FITING_BUF_TUPLES_PER_SEG *
+							   sizeof(FitingLeafTuple);
+
+					memcpy(slot_ptr, compacted,
+						   new_n * sizeof(FitingLeafTuple));
+					memset(slot_ptr + new_n * sizeof(FitingLeafTuple), 0,
+						   (FITING_BUF_TUPLES_PER_SEG - new_n) *
+						   sizeof(FitingLeafTuple));
+
+					GenericXLogFinish(xstate);
+					UnlockReleaseBuffer(bbuf);
+
+					FitingBufSetInfo(seg, slot, new_n);
+				}
+				/* else new_n == num_buf: nothing to do */
+			}
 		}
 	}
 

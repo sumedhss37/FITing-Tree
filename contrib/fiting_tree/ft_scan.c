@@ -77,7 +77,7 @@ find_segment_index(const FitingDirEntry *entries, int num_segs, int64 key)
 static bool
 get_seg_tuple_at_local_rank(Relation index,
 							 const FitingDirEntry *seg,
-							 const FitingPageListNode *pool,
+							 const FitingDirPageContent *dir,
 							 int64 local_rank,
 							 FitingLeafTuple *out)
 {
@@ -89,6 +89,7 @@ get_seg_tuple_at_local_rank(Relation index,
 	Buffer		buf;
 	Page		page;
 	FitingLeafTuple *tuples;
+	FitingPageListNode nd;
 
 	if (local_rank < 0 || local_rank >= seg->seg_total_tuples)
 		return false;
@@ -103,12 +104,14 @@ get_seg_tuple_at_local_rank(Relation index,
 	{
 		if (node_idx < 0)
 			return false;
-		node_idx = pool[node_idx].next;
+		fiting_get_node(index, dir, node_idx, &nd);
+		node_idx = nd.next;
 	}
 	if (node_idx < 0)
 		return false;
 
-	buf    = ReadBuffer(index, pool[node_idx].page_no);
+	fiting_get_node(index, dir, node_idx, &nd);
+	buf    = ReadBuffer(index, nd.page_no);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page   = BufferGetPage(buf);
 	tuples = FitingPageGetLeaf(page);
@@ -130,7 +133,7 @@ get_seg_tuple_at_local_rank(Relation index,
 static bool
 search_seg_data(Relation index,
 				const FitingDirEntry *seg,
-				const FitingPageListNode *pool,
+				const FitingDirPageContent *dir,
 				int64 lo, int64 hi,
 				int64 search_key,
 				ItemPointerData *result_tid)
@@ -141,7 +144,7 @@ search_seg_data(Relation index,
 	{
 		int64 mid = lo + (hi - lo) / 2;
 
-		if (!get_seg_tuple_at_local_rank(index, seg, pool, mid, &tup))
+		if (!get_seg_tuple_at_local_rank(index, seg, dir, mid, &tup))
 			break;
 
 		if (tup.key == search_key)
@@ -155,7 +158,7 @@ search_seg_data(Relation index,
 			/* Tombstone — scan left then right for a live copy */
 			for (int64 r = mid - 1; r >= lo; r--)
 			{
-				if (!get_seg_tuple_at_local_rank(index, seg, pool, r, &tup))
+				if (!get_seg_tuple_at_local_rank(index, seg, dir, r, &tup))
 					break;
 				if (tup.key != search_key)
 					break;
@@ -167,7 +170,7 @@ search_seg_data(Relation index,
 			}
 			for (int64 r = mid + 1; r <= hi; r++)
 			{
-				if (!get_seg_tuple_at_local_rank(index, seg, pool, r, &tup))
+				if (!get_seg_tuple_at_local_rank(index, seg, dir, r, &tup))
 					break;
 				if (tup.key != search_key)
 					break;
@@ -207,14 +210,16 @@ search_seg_buffer(Relation index,
 	int				num_buf;
 	int				lo, hi;
 
-	if (seg->buf_blkno == InvalidBlockNumber || seg->num_buffer_tuples == 0)
+	num_buf = FitingBufCount(seg);	/* declared above, set here */
+	if (seg->buf_blkno == InvalidBlockNumber || num_buf == 0)
 		return false;
 
 	buf_rel = ReadBuffer(index, seg->buf_blkno);
 	LockBuffer(buf_rel, BUFFER_LOCK_SHARE);
 	page    = BufferGetPage(buf_rel);
-	tuples  = FitingPageGetLeaf(page);
-	num_buf = seg->num_buffer_tuples;
+	/* Offset into the shared page to reach this segment's 32-tuple slot */
+	tuples  = FitingPageGetLeaf(page) +
+			  FitingBufSlot(seg) * FITING_BUF_TUPLES_PER_SEG;
 
 	lo = 0;
 	hi = num_buf - 1;
@@ -255,10 +260,10 @@ search_seg_buffer(Relation index,
  * ----------------------------------------------------------------------- */
 static bool
 search_btree_seg(Relation index,
-				 const FitingDirEntry    *seg,
-				 const FitingPageListNode *pool,
-				 int64					  search_key,
-				 ItemPointerData		 *result_tid)
+				 const FitingDirEntry      *seg,
+				 const FitingDirPageContent *dir,
+				 int64					    search_key,
+				 ItemPointerData		   *result_tid)
 {
 	int				node_idx = seg->page_list_head;
 	int				target   = -1;
@@ -267,34 +272,54 @@ search_btree_seg(Relation index,
 	FitingLeafTuple *tuples;
 	int				ntuples;
 	int				lo, hi;
+	FitingPageListNode nd;
 
 	/* Key is before the first key stored in this segment */
-	if (node_idx < 0 || pool[node_idx].page_start_key > search_key)
+	if (node_idx < 0)
+		return false;
+	fiting_get_node(index, dir, node_idx, &nd);
+	if (nd.page_start_key > search_key)
 		return false;
 
 	/*
-	 * Walk pool nodes (in-memory array, no disk I/O) to find the page whose
-	 * range [page_start_key, next_page_start_key) contains search_key.
-	 * For BTREE segments, there are at most FITING_BTREE_WINDOW / 510 ≈ 8
-	 * pages, so this loop is bounded and fast.
+	 * Walk pool nodes to find the page whose range
+	 * [page_start_key, next_page_start_key) contains search_key.
+	 * For BTREE segments there are at most FITING_BTREE_WINDOW / 510 ≈ 8
+	 * pages; primary-pool nodes require no I/O.
 	 */
 	while (node_idx >= 0)
 	{
-		int next = pool[node_idx].next;
+		FitingPageListNode cur_nd;
+		int next_idx;
 
-		if (next < 0 || pool[next].page_start_key > search_key)
+		fiting_get_node(index, dir, node_idx, &cur_nd);
+		next_idx = cur_nd.next;
+
+		if (next_idx < 0)
 		{
 			target = node_idx;
 			break;
 		}
-		node_idx = next;
+
+		{
+			FitingPageListNode next_nd;
+
+			fiting_get_node(index, dir, next_idx, &next_nd);
+			if (next_nd.page_start_key > search_key)
+			{
+				target = node_idx;
+				break;
+			}
+		}
+		node_idx = next_idx;
 	}
 
 	if (target < 0)
 		return false;
 
 	/* ── Single ReadBuffer ─────────────────────────────────────────────── */
-	buf    = ReadBuffer(index, pool[target].page_no);
+	fiting_get_node(index, dir, target, &nd);
+	buf    = ReadBuffer(index, nd.page_no);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page   = BufferGetPage(buf);
 	tuples = FitingPageGetLeaf(page);
@@ -419,7 +444,6 @@ fiting_gettuple(IndexScanDesc scan, ScanDirection direction)
 	if (!so->data_done)
 	{
 		FitingDirEntry		*seg;
-		FitingPageListNode	*pool;
 		ItemPointerData		 result_tid;
 
 		so->data_done = true;
@@ -467,8 +491,7 @@ fiting_gettuple(IndexScanDesc scan, ScanDirection direction)
 		if (so->seg_idx < 0)
 			goto phase2;
 
-		seg  = &so->dir_copy->entries[so->seg_idx];
-		pool = so->dir_copy->pool;
+		seg = &so->dir_copy->entries[so->seg_idx];
 
 		if (FitingSegType(seg) == FITING_SEG_TYPE_FITING)
 		{
@@ -486,7 +509,8 @@ fiting_gettuple(IndexScanDesc scan, ScanDirection direction)
 			if (hi >= seg->seg_total_tuples)
 				hi = seg->seg_total_tuples - 1;
 
-			if (search_seg_data(index, seg, pool, lo, hi, search_key, &result_tid))
+			if (search_seg_data(index, seg, so->dir_copy, lo, hi,
+								search_key, &result_tid))
 			{
 				scan->xs_heaptid = result_tid;
 				scan->xs_recheck = false;
@@ -496,10 +520,12 @@ fiting_gettuple(IndexScanDesc scan, ScanDirection direction)
 		else
 		{
 			/*
-			 * BTREE path: in-memory pool walk to identify the target page by
+			 * BTREE path: pool walk to identify the target page by
 			 * page_start_key, then exactly 1 ReadBuffer + in-page binary search.
+			 * Primary nodes need no disk I/O; overflow nodes use ReadBuffer.
 			 */
-			if (search_btree_seg(index, seg, pool, search_key, &result_tid))
+			if (search_btree_seg(index, seg, so->dir_copy, search_key,
+								 &result_tid))
 			{
 				scan->xs_heaptid = result_tid;
 				scan->xs_recheck = false;
