@@ -3,18 +3,19 @@
  * ft_scan.c
  *   FITing-Tree index scan (ambeginscan / amrescan / amgettuple / amendscan).
  *
- * Lookup algorithm (Checkpoint 2 — per-segment page ownership):
+ * Lookup algorithm (non-contiguous segment pages via linked list):
  *
  *   Phase 1 — data pages:
- *     1. Read meta page → max_error, num_segments.
- *     2. Read and cache directory page.
- *     3. Binary-search directory for the segment whose start_key ≤ search_key.
+ *     1. Read meta → max_error.
+ *     2. Read and cache full directory page (FitingDirPageContent).
+ *     3. Binary-search directory entries for the segment whose
+ *        start_key ≤ search_key.
  *     4. Predict local rank:
  *          local_pred = (search_key − seg.start_key) × seg.slope
  *     5. Clamp to [0, seg.seg_total_tuples−1] ± max_error.
- *     6. Binary-search the segment's data pages within the window.
- *        Skip entries flagged FITING_LEAF_DELETED.
- *        On a deleted hit for the right key, scan linearly left/right.
+ *     6. Binary-search within the window by walking the segment's page
+ *        linked list.  Skip FITING_LEAF_DELETED entries; on a deleted
+ *        hit, scan linearly left/right within [lo, hi].
  *     7. If found: set scan->xs_heaptid, return true.
  *
  *   Phase 2 — buffer page (if Phase 1 missed):
@@ -35,11 +36,11 @@
 /* -----------------------------------------------------------------------
  * find_segment_index
  *
- * Binary-search the directory for the largest i where dir[i].start_key ≤ key.
- * Returns -1 if key < dir[0].start_key.
+ * Binary-search directory entries for the largest i where
+ * entries[i].start_key ≤ key.  Returns -1 if key < entries[0].start_key.
  * ----------------------------------------------------------------------- */
 static int
-find_segment_index(const FitingDirEntry *dir, int num_segs, int64 key)
+find_segment_index(const FitingDirEntry *entries, int num_segs, int64 key)
 {
 	int lo = 0, hi = num_segs - 1, result = -1;
 
@@ -47,10 +48,10 @@ find_segment_index(const FitingDirEntry *dir, int num_segs, int64 key)
 	{
 		int mid = (lo + hi) / 2;
 
-		if (dir[mid].start_key <= key)
+		if (entries[mid].start_key <= key)
 		{
 			result = mid;
-			lo = mid + 1;
+			lo     = mid + 1;
 		}
 		else
 		{
@@ -63,21 +64,28 @@ find_segment_index(const FitingDirEntry *dir, int num_segs, int64 key)
 /* -----------------------------------------------------------------------
  * get_seg_tuple_at_local_rank
  *
- * Read the FitingLeafTuple at local position `local_rank` within segment
- * `seg`.  Returns false if the position is out of range.
+ * Read the FitingLeafTuple at local position local_rank within segment
+ * seg by walking the segment's page linked list stored in pool[].
  *
- * Rank-to-address formula:
+ * Address formula (same semantics as before; now traverses the list):
  *   absolute = seg->start_slot + local_rank
- *   page_idx = absolute / FITING_TUPLES_PER_PAGE
- *   slot     = absolute % FITING_TUPLES_PER_PAGE
+ *   page_idx = absolute / FITING_TUPLES_PER_PAGE   (how far to walk)
+ *   slot     = absolute % FITING_TUPLES_PER_PAGE   (slot within that page)
+ *
+ * Returns false if the position is out of range.
  * ----------------------------------------------------------------------- */
 static bool
-get_seg_tuple_at_local_rank(Relation index, const FitingDirEntry *seg,
-							 int64 local_rank, FitingLeafTuple *out)
+get_seg_tuple_at_local_rank(Relation index,
+							 const FitingDirEntry *seg,
+							 const FitingPageListNode *pool,
+							 int64 local_rank,
+							 FitingLeafTuple *out)
 {
-	int			absolute;
-	int			page_idx;
+	int64		absolute;
+	int64		page_idx;
 	int			slot;
+	int			node_idx;
+	int64		p;
 	Buffer		buf;
 	Page		page;
 	FitingLeafTuple *tuples;
@@ -85,18 +93,26 @@ get_seg_tuple_at_local_rank(Relation index, const FitingDirEntry *seg,
 	if (local_rank < 0 || local_rank >= seg->seg_total_tuples)
 		return false;
 
-	absolute = (int) seg->start_slot + (int) local_rank;
+	absolute = (int64) seg->start_slot + local_rank;
 	page_idx = absolute / FITING_TUPLES_PER_PAGE;
-	slot     = absolute % FITING_TUPLES_PER_PAGE;
+	slot     = (int) (absolute % FITING_TUPLES_PER_PAGE);
 
-	if (page_idx >= seg->num_data_pages)
+	/* Walk the linked list to the page_idx-th node */
+	node_idx = seg->page_list_head;
+	for (p = 0; p < page_idx; p++)
+	{
+		if (node_idx < 0)
+			return false;
+		node_idx = pool[node_idx].next;
+	}
+	if (node_idx < 0)
 		return false;
 
-	buf = ReadBuffer(index, seg->first_data_blkno + page_idx);
+	buf    = ReadBuffer(index, pool[node_idx].page_no);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
+	page   = BufferGetPage(buf);
 	tuples = FitingPageGetLeaf(page);
-	*out = tuples[slot];
+	*out   = tuples[slot];
 	UnlockReleaseBuffer(buf);
 
 	return true;
@@ -112,8 +128,11 @@ get_seg_tuple_at_local_rank(Relation index, const FitingDirEntry *seg,
  * Returns true and fills *result_tid if found.
  * ----------------------------------------------------------------------- */
 static bool
-search_seg_data(Relation index, const FitingDirEntry *seg,
-				int64 lo, int64 hi, int64 search_key,
+search_seg_data(Relation index,
+				const FitingDirEntry *seg,
+				const FitingPageListNode *pool,
+				int64 lo, int64 hi,
+				int64 search_key,
 				ItemPointerData *result_tid)
 {
 	FitingLeafTuple tup;
@@ -122,7 +141,7 @@ search_seg_data(Relation index, const FitingDirEntry *seg,
 	{
 		int64 mid = lo + (hi - lo) / 2;
 
-		if (!get_seg_tuple_at_local_rank(index, seg, mid, &tup))
+		if (!get_seg_tuple_at_local_rank(index, seg, pool, mid, &tup))
 			break;
 
 		if (tup.key == search_key)
@@ -133,13 +152,10 @@ search_seg_data(Relation index, const FitingDirEntry *seg,
 				return true;
 			}
 
-			/*
-			 * Key matches but entry is a tombstone.  Scan linearly left
-			 * then right within [lo, hi] for a live copy of the same key.
-			 */
+			/* Tombstone — scan left then right for a live copy */
 			for (int64 r = mid - 1; r >= lo; r--)
 			{
-				if (!get_seg_tuple_at_local_rank(index, seg, r, &tup))
+				if (!get_seg_tuple_at_local_rank(index, seg, pool, r, &tup))
 					break;
 				if (tup.key != search_key)
 					break;
@@ -151,7 +167,7 @@ search_seg_data(Relation index, const FitingDirEntry *seg,
 			}
 			for (int64 r = mid + 1; r <= hi; r++)
 			{
-				if (!get_seg_tuple_at_local_rank(index, seg, r, &tup))
+				if (!get_seg_tuple_at_local_rank(index, seg, pool, r, &tup))
 					break;
 				if (tup.key != search_key)
 					break;
@@ -161,8 +177,7 @@ search_seg_data(Relation index, const FitingDirEntry *seg,
 					return true;
 				}
 			}
-			/* Key found but all copies deleted */
-			return false;
+			return false;	/* key found but all copies deleted */
 		}
 		else if (tup.key < search_key)
 			lo = mid + 1;
@@ -181,8 +196,10 @@ search_seg_data(Relation index, const FitingDirEntry *seg,
  * Returns true and fills *result_tid if found.
  * ----------------------------------------------------------------------- */
 static bool
-search_seg_buffer(Relation index, const FitingDirEntry *seg,
-				  int64 search_key, ItemPointerData *result_tid)
+search_seg_buffer(Relation index,
+				  const FitingDirEntry *seg,
+				  int64 search_key,
+				  ItemPointerData *result_tid)
 {
 	Buffer			buf_rel;
 	Page			page;
@@ -195,8 +212,8 @@ search_seg_buffer(Relation index, const FitingDirEntry *seg,
 
 	buf_rel = ReadBuffer(index, seg->buf_blkno);
 	LockBuffer(buf_rel, BUFFER_LOCK_SHARE);
-	page   = BufferGetPage(buf_rel);
-	tuples = FitingPageGetLeaf(page);
+	page    = BufferGetPage(buf_rel);
+	tuples  = FitingPageGetLeaf(page);
 	num_buf = seg->num_buffer_tuples;
 
 	lo = 0;
@@ -223,21 +240,135 @@ search_seg_buffer(Relation index, const FitingDirEntry *seg,
 }
 
 /* -----------------------------------------------------------------------
+ * search_btree_seg
+ *
+ * Locate search_key within a BTREE segment using the per-page start_key
+ * stored in pool nodes.
+ *
+ * Cost:
+ *   - O(pages_in_seg) in-memory pool walk  (≤ 8 pool-array accesses, no I/O;
+ *     pool is the palloc'd in-memory copy held in the scan opaque)
+ *   - Exactly 1 ReadBuffer on the identified target page
+ *   - O(log FITING_TUPLES_PER_PAGE) binary search within that page
+ *
+ * Returns true and fills *result_tid if a live tuple with search_key is found.
+ * ----------------------------------------------------------------------- */
+static bool
+search_btree_seg(Relation index,
+				 const FitingDirEntry    *seg,
+				 const FitingPageListNode *pool,
+				 int64					  search_key,
+				 ItemPointerData		 *result_tid)
+{
+	int				node_idx = seg->page_list_head;
+	int				target   = -1;
+	Buffer			buf;
+	Page			page;
+	FitingLeafTuple *tuples;
+	int				ntuples;
+	int				lo, hi;
+
+	/* Key is before the first key stored in this segment */
+	if (node_idx < 0 || pool[node_idx].page_start_key > search_key)
+		return false;
+
+	/*
+	 * Walk pool nodes (in-memory array, no disk I/O) to find the page whose
+	 * range [page_start_key, next_page_start_key) contains search_key.
+	 * For BTREE segments, there are at most FITING_BTREE_WINDOW / 510 ≈ 8
+	 * pages, so this loop is bounded and fast.
+	 */
+	while (node_idx >= 0)
+	{
+		int next = pool[node_idx].next;
+
+		if (next < 0 || pool[next].page_start_key > search_key)
+		{
+			target = node_idx;
+			break;
+		}
+		node_idx = next;
+	}
+
+	if (target < 0)
+		return false;
+
+	/* ── Single ReadBuffer ─────────────────────────────────────────────── */
+	buf    = ReadBuffer(index, pool[target].page_no);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page   = BufferGetPage(buf);
+	tuples = FitingPageGetLeaf(page);
+
+	ntuples = FitingPageGetNumTuples(page);
+
+	lo = 0;
+	hi = ntuples - 1;
+	while (lo <= hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+
+		if (tuples[mid].key == search_key)
+		{
+			if (!(tuples[mid].flags & FITING_LEAF_DELETED))
+			{
+				*result_tid = tuples[mid].tid;
+				UnlockReleaseBuffer(buf);
+				return true;
+			}
+			/* Tombstone — scan left then right for a live copy */
+			{
+				int r;
+
+				for (r = mid - 1; r >= lo; r--)
+				{
+					if (tuples[r].key != search_key) break;
+					if (!(tuples[r].flags & FITING_LEAF_DELETED))
+					{
+						*result_tid = tuples[r].tid;
+						UnlockReleaseBuffer(buf);
+						return true;
+					}
+				}
+				for (r = mid + 1; r <= hi; r++)
+				{
+					if (tuples[r].key != search_key) break;
+					if (!(tuples[r].flags & FITING_LEAF_DELETED))
+					{
+						*result_tid = tuples[r].tid;
+						UnlockReleaseBuffer(buf);
+						return true;
+					}
+				}
+			}
+			UnlockReleaseBuffer(buf);
+			return false;	/* key present but all copies deleted */
+		}
+		else if (tuples[mid].key < search_key)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+
+	UnlockReleaseBuffer(buf);
+	return false;
+}
+
+/* -----------------------------------------------------------------------
  * fiting_beginscan
  * ----------------------------------------------------------------------- */
 IndexScanDesc
 fiting_beginscan(Relation indexRelation, int nkeys, int norderbys)
 {
-	IndexScanDesc	scan;
+	IndexScanDesc	 scan;
 	FitingScanOpaque so;
 
 	scan = RelationGetIndexScan(indexRelation, nkeys, norderbys);
 
 	so = palloc0(sizeof(FitingScanOpaqueData));
-	so->data_done = false;
-	so->buf_done  = false;
-	so->dir_copy  = NULL;
-	so->seg_idx   = -1;
+	so->data_done  = false;
+	so->buf_done   = false;
+	so->dir_copy   = NULL;
+	so->seg_idx    = -1;
 	so->search_key = 0;
 
 	scan->opaque = so;
@@ -253,12 +384,10 @@ fiting_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
 	FitingScanOpaque so = (FitingScanOpaque) scan->opaque;
 
-	/* Reset scan state for a new search */
 	so->data_done = false;
 	so->buf_done  = false;
 	so->seg_idx   = -1;
 
-	/* Release cached directory if present */
 	if (so->dir_copy)
 	{
 		pfree(so->dir_copy);
@@ -282,21 +411,20 @@ fiting_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 bool
 fiting_gettuple(IndexScanDesc scan, ScanDirection direction)
 {
-	FitingScanOpaque	so    = (FitingScanOpaque) scan->opaque;
-	Relation			index = scan->indexRelation;
+	FitingScanOpaque	so        = (FitingScanOpaque) scan->opaque;
+	Relation			index     = scan->indexRelation;
 	int64				search_key = so->search_key;
 
 	/* ---- Phase 1: data pages ----------------------------------------- */
 	if (!so->data_done)
 	{
-		FitingDirEntry	   *seg;
-		int64				local_pred;
-		int64				lo, hi;
-		ItemPointerData		result_tid;
+		FitingDirEntry		*seg;
+		FitingPageListNode	*pool;
+		ItemPointerData		 result_tid;
 
 		so->data_done = true;
 
-		/* Load and cache directory + meta on first call */
+		/* Load and cache full directory page on first call */
 		if (so->dir_copy == NULL)
 		{
 			Buffer				buf;
@@ -314,50 +442,69 @@ fiting_gettuple(IndexScanDesc scan, ScanDirection direction)
 				elog(ERROR, "fiting_tree: bad magic in meta page");
 			}
 
-			so->num_segs   = meta->num_segments;
-			so->max_error  = meta->max_error;
+			so->max_error = meta->max_error;
+			so->num_segs  = meta->num_segments;
 			UnlockReleaseBuffer(buf);
 
+			/*
+			 * Check for empty index BEFORE reading the directory page.
+			 * On a table built empty, block 1 still exists but has no entries;
+			 * reading it is harmless, but short-circuiting here avoids the
+			 * unnecessary I/O and guards against any edge-case where block 1
+			 * was not written (older on-disk format).
+			 */
 			if (so->num_segs == 0)
 			{
-				so->buf_done = true;	/* nothing to search */
+				so->buf_done = true;
 				return false;
 			}
 
-			buf  = ReadBuffer(index, FITING_DIR_BLKNO);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-
-			so->dir_copy = palloc(so->num_segs * sizeof(FitingDirEntry));
-			memcpy(so->dir_copy, FitingPageGetDir(page),
-				   so->num_segs * sizeof(FitingDirEntry));
-			UnlockReleaseBuffer(buf);
+			so->dir_copy = fiting_read_dir_copy(index);
 		}
 
-		so->seg_idx = find_segment_index(so->dir_copy, so->num_segs,
+		so->seg_idx = find_segment_index(so->dir_copy->entries, so->num_segs,
 										 search_key);
 		if (so->seg_idx < 0)
-			goto phase2;	/* key before all segment start_keys */
+			goto phase2;
 
-		seg = &so->dir_copy[so->seg_idx];
+		seg  = &so->dir_copy->entries[so->seg_idx];
+		pool = so->dir_copy->pool;
 
-		/* Predict local rank within this segment */
-		local_pred = (int64) ((double) (search_key - seg->start_key)
-							  * seg->slope);
-
-		lo = local_pred - so->max_error;
-		hi = local_pred + so->max_error;
-
-		if (lo < 0)
-			lo = 0;
-		if (hi >= seg->seg_total_tuples)
-			hi = seg->seg_total_tuples - 1;
-
-		if (search_seg_data(index, seg, lo, hi, search_key, &result_tid))
+		if (FitingSegType(seg) == FITING_SEG_TYPE_FITING)
 		{
-			scan->xs_heaptid = result_tid;
-			scan->xs_recheck = false;
-			return true;
+			/*
+			 * FITING path: use the linear model to predict the rank, then
+			 * binary-search within the narrow [lo, hi] window.
+			 */
+			int64 local_pred = (int64) ((double) (search_key - seg->start_key)
+										* seg->slope);
+			int64 lo         = local_pred - so->max_error;
+			int64 hi         = local_pred + so->max_error;
+
+			if (lo < 0)
+				lo = 0;
+			if (hi >= seg->seg_total_tuples)
+				hi = seg->seg_total_tuples - 1;
+
+			if (search_seg_data(index, seg, pool, lo, hi, search_key, &result_tid))
+			{
+				scan->xs_heaptid = result_tid;
+				scan->xs_recheck = false;
+				return true;
+			}
+		}
+		else
+		{
+			/*
+			 * BTREE path: in-memory pool walk to identify the target page by
+			 * page_start_key, then exactly 1 ReadBuffer + in-page binary search.
+			 */
+			if (search_btree_seg(index, seg, pool, search_key, &result_tid))
+			{
+				scan->xs_heaptid = result_tid;
+				scan->xs_recheck = false;
+				return true;
+			}
 		}
 	}
 
@@ -369,13 +516,9 @@ phase2:
 
 		so->buf_done = true;
 
-		/*
-		 * If seg_idx < 0 (key is before all segments) we have no segment
-		 * to check a buffer for — skip.
-		 */
 		if (so->seg_idx >= 0 && so->dir_copy != NULL)
 		{
-			FitingDirEntry *seg = &so->dir_copy[so->seg_idx];
+			FitingDirEntry *seg = &so->dir_copy->entries[so->seg_idx];
 
 			if (search_seg_buffer(index, seg, search_key, &result_tid))
 			{

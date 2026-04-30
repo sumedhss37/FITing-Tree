@@ -9,7 +9,9 @@ OBJS = \
 	ft_insert.o \
 	ft_vacuum.o \
 	ft_cost.o \
-	ft_utils.o
+	ft_utils.o \
+	ft_options.o \
+	ft_info.o
 
 EXTENSION = fiting_tree
 DATA = fiting_tree--1.0.sql

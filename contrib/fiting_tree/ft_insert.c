@@ -5,20 +5,21 @@
  *
  * Algorithm:
  *   1. Skip NULL keys and HOT-update no-ops (indexUnchanged = true).
- *   2. Binary-search directory for the segment that owns the new key.
- *   3. Load the segment's sorted buffer page into memory.
- *   4. Binary-insert the new (key, TID) into the in-memory buffer.
+ *   2. Read meta + page_tuple_counts and the full directory page.
+ *   3. Binary-search directory entries for the segment that owns the key.
+ *   4. Load the segment's sorted buffer page into memory.
+ *   5. Binary-insert the new (key, TID) into the in-memory buffer.
  *   5a. If buffer is now full (count >= max_error):
+ *         Write the updated buffer to disk so fiting_resegment can read it.
  *         Call fiting_resegment(), which:
- *           - Merges live data + buffer
- *           - Filters out FITING_LEAF_DELETED tombstones
- *           - Runs ShrinkingCone
- *           - Writes new segment pages, frees old pages
+ *           - Collects live data + buffer (walks node list)
+ *           - Frees old pages (ref-count aware)
+ *           - Allocates new pages (freelist-first)
  *           - Updates directory and meta on disk
  *   5b. Otherwise:
  *         Write the updated buffer back to its page (allocating one if
  *         buf_blkno == InvalidBlockNumber).
- *         Update directory entry and meta page on disk.
+ *         Write directory and meta+counts to disk.
  *
  *-------------------------------------------------------------------------
  */
@@ -31,72 +32,13 @@
 #include "utils/rel.h"
 
 /* -----------------------------------------------------------------------
- * read_meta_copy
- *
- * Read meta page and return a by-value copy.  Releases buffer before
- * returning so the caller holds no lock.
- * ----------------------------------------------------------------------- */
-static FitingMetaPageData
-read_meta_copy(Relation index)
-{
-	Buffer				buf;
-	Page				page;
-	FitingMetaPageData *meta_ptr;
-	FitingMetaPageData	meta;
-
-	buf      = ReadBuffer(index, FITING_META_BLKNO);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page     = BufferGetPage(buf);
-	meta_ptr = FitingPageGetMeta(page);
-
-	if (meta_ptr->magic != FITING_MAGIC)
-	{
-		UnlockReleaseBuffer(buf);
-		elog(ERROR, "fiting_tree: bad magic in meta page");
-	}
-
-	meta = *meta_ptr;
-	UnlockReleaseBuffer(buf);
-	return meta;
-}
-
-/* -----------------------------------------------------------------------
- * read_dir_copy
- *
- * Read directory page and return a palloc'd copy of the entry array.
- * ----------------------------------------------------------------------- */
-static FitingDirEntry *
-read_dir_copy(Relation index, int num_segs)
-{
-	Buffer			buf;
-	Page			page;
-	FitingDirEntry *dir;
-
-	buf  = ReadBuffer(index, FITING_DIR_BLKNO);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-
-	/*
-	 * Allocate the full directory capacity, not just num_segs entries.
-	 * fiting_resegment() may expand the directory in-place (when one segment
-	 * splits into multiple new ones); we need headroom to avoid a buffer
-	 * overflow that would corrupt adjacent palloc chunks.
-	 */
-	dir = palloc(FITING_DIR_ENTRIES_MAX * sizeof(FitingDirEntry));
-	memcpy(dir, FitingPageGetDir(page), num_segs * sizeof(FitingDirEntry));
-
-	UnlockReleaseBuffer(buf);
-	return dir;
-}
-
-/* -----------------------------------------------------------------------
  * find_segment_index
  *
- * Binary-search: largest i where dir[i].start_key <= key.
- * Returns -1 if key < dir[0].start_key.
+ * Binary-search: largest i where entries[i].start_key <= key.
+ * Returns -1 if key < entries[0].start_key.
  * ----------------------------------------------------------------------- */
 static int
-find_segment_index(const FitingDirEntry *dir, int num_segs, int64 key)
+find_segment_index(const FitingDirEntry *entries, int num_segs, int64 key)
 {
 	int lo = 0, hi = num_segs - 1, result = -1;
 
@@ -104,10 +46,10 @@ find_segment_index(const FitingDirEntry *dir, int num_segs, int64 key)
 	{
 		int mid = (lo + hi) / 2;
 
-		if (dir[mid].start_key <= key)
+		if (entries[mid].start_key <= key)
 		{
 			result = mid;
-			lo = mid + 1;
+			lo     = mid + 1;
 		}
 		else
 		{
@@ -149,9 +91,9 @@ load_buffer_page(Relation index, BlockNumber buf_blkno, int num_buf)
 /* -----------------------------------------------------------------------
  * binary_find_insert_pos
  *
- * Return the index at which (key, tid) should be inserted into buf[0..n)
- * to keep it sorted ascending by key.  On duplicate keys, new entry goes
- * after existing ones (stable insert at right end of key run).
+ * Return the index at which key should be inserted into buf[0..n) to
+ * keep it sorted ascending.  On duplicate keys, new entry goes after
+ * existing ones (stable insert at right end of key run).
  * ----------------------------------------------------------------------- */
 static int
 binary_find_insert_pos(const FitingLeafTuple *buf, int n, int64 key)
@@ -174,13 +116,15 @@ binary_find_insert_pos(const FitingLeafTuple *buf, int n, int64 key)
  * write_buffer_page
  *
  * Write buf[0..num_buf) to the segment's buffer page.
- * If buf_blkno is InvalidBlockNumber, allocates a new page and updates
- * seg->buf_blkno in the caller's dir copy.
- * meta may be updated (freelist_head); caller writes it to disk.
+ * If buf_blkno is InvalidBlockNumber, allocates a new page via
+ * fiting_alloc_page (which sets counts[blkno]=1) and updates seg->buf_blkno.
+ * meta and counts may be modified (freelist_head, counts[]); caller writes
+ * them back to disk.
  * ----------------------------------------------------------------------- */
 static void
 write_buffer_page(Relation index,
 				  FitingMetaPageData *meta,
+				  int32 *counts,
 				  FitingDirEntry *seg,
 				  FitingLeafTuple *buf, int num_buf)
 {
@@ -191,7 +135,7 @@ write_buffer_page(Relation index,
 
 	if (seg->buf_blkno == InvalidBlockNumber)
 	{
-		blkno = fiting_alloc_page(index, meta);
+		blkno          = fiting_alloc_page(index, meta, counts);
 		seg->buf_blkno = blkno;
 	}
 	else
@@ -199,9 +143,8 @@ write_buffer_page(Relation index,
 		blkno = seg->buf_blkno;
 	}
 
-	rbuf = ReadBuffer(index, blkno);
+	rbuf   = ReadBuffer(index, blkno);
 	LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
-
 	xstate = GenericXLogStart(index);
 	page   = GenericXLogRegisterBuffer(xstate, rbuf, GENERIC_XLOG_FULL_IMAGE);
 
@@ -211,54 +154,6 @@ write_buffer_page(Relation index,
 
 	GenericXLogFinish(xstate);
 	UnlockReleaseBuffer(rbuf);
-}
-
-/* -----------------------------------------------------------------------
- * write_dir_page — overwrite directory (block 1) in place
- * ----------------------------------------------------------------------- */
-static void
-write_dir_page(Relation index, const FitingDirEntry *dir, int num_segs)
-{
-	Buffer				buf;
-	Page				page;
-	GenericXLogState   *xstate;
-
-	buf  = ReadBuffer(index, FITING_DIR_BLKNO);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-	xstate = GenericXLogStart(index);
-	page   = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
-
-	FitingInitPage(page, FITING_F_DIR);
-	memcpy(PageGetContents(page), dir, num_segs * sizeof(FitingDirEntry));
-	((PageHeader) page)->pd_lower += num_segs * sizeof(FitingDirEntry);
-
-	GenericXLogFinish(xstate);
-	UnlockReleaseBuffer(buf);
-}
-
-/* -----------------------------------------------------------------------
- * write_meta_page — overwrite meta (block 0) in place
- * ----------------------------------------------------------------------- */
-static void
-write_meta_page(Relation index, const FitingMetaPageData *meta)
-{
-	Buffer				buf;
-	Page				page;
-	GenericXLogState   *xstate;
-
-	buf  = ReadBuffer(index, FITING_META_BLKNO);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-	xstate = GenericXLogStart(index);
-	page   = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
-
-	FitingInitPage(page, FITING_F_META);
-	memcpy(PageGetContents(page), meta, sizeof(FitingMetaPageData));
-	((PageHeader) page)->pd_lower += sizeof(FitingMetaPageData);
-
-	GenericXLogFinish(xstate);
-	UnlockReleaseBuffer(buf);
 }
 
 /* -----------------------------------------------------------------------
@@ -276,7 +171,8 @@ fiting_insert(Relation indexRelation,
 {
 	int64				key;
 	FitingMetaPageData	meta;
-	FitingDirEntry	   *dir;
+	int32			   *counts;
+	FitingDirPageContent *dir;
 	int					seg_idx;
 	FitingDirEntry	   *seg;
 	FitingLeafTuple    *buf;
@@ -297,40 +193,39 @@ fiting_insert(Relation indexRelation,
 	key = FitingDatumGetKey(values[0],
 							TupleDescAttr(RelationGetDescr(indexRelation), 0)->atttypid);
 
-	/* ---- 1. Read meta + directory ------------------------------------ */
-	meta = read_meta_copy(indexRelation);
+	/* ---- 1. Read meta + counts + directory --------------------------- */
+	counts = palloc0(FITING_META_MAX_PAGES * sizeof(int32));
+	meta   = fiting_read_meta_and_counts(indexRelation, counts);
 
 	/*
-	 * Edge case: index is empty (built on an empty table).  We cannot
-	 * insert into a segment that doesn't exist.  Treat this as a no-op;
-	 * the user should rebuild the index after the first bulk load.
+	 * Edge case: index is empty.  We cannot insert into a segment that
+	 * doesn't exist.  The user should rebuild after the first bulk load.
 	 */
 	if (meta.num_segments == 0)
 	{
+		pfree(counts);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("fiting_tree: cannot insert into an empty index"),
 				 errhint("Populate the table and run CREATE INDEX USING fiting.")));
 	}
 
-	dir = read_dir_copy(indexRelation, meta.num_segments);
+	dir = fiting_read_dir_copy(indexRelation);
 
 	/* ---- 2. Find the owning segment ---------------------------------- */
-	seg_idx = find_segment_index(dir, meta.num_segments, key);
+	seg_idx = find_segment_index(dir->entries, dir->hdr.num_segments, key);
 
 	/*
 	 * If the key is smaller than all segment start_keys, use segment 0.
-	 * The FITing-Tree guarantees all keys map to some segment; a key below
-	 * the first start_key is closest to segment 0.
 	 */
 	if (seg_idx < 0)
 		seg_idx = 0;
 
-	seg = &dir[seg_idx];
+	seg = &dir->entries[seg_idx];
 
 	/* ---- 3. Load buffer ---------------------------------------------- */
 	num_buf = seg->num_buffer_tuples;
-	buf = load_buffer_page(indexRelation, seg->buf_blkno, num_buf);
+	buf     = load_buffer_page(indexRelation, seg->buf_blkno, num_buf);
 
 	/* ---- 4. Binary-insert into in-memory buffer ---------------------- */
 	buf = repalloc(buf, (num_buf + 1) * sizeof(FitingLeafTuple));
@@ -350,49 +245,50 @@ fiting_insert(Relation indexRelation,
 	if (num_buf >= meta.max_error)
 	{
 		/*
-		 * Buffer is full.  Temporarily put the updated buffer back into the
-		 * dir entry so fiting_resegment() can read it from there.
-		 * We write it to disk first, then let resegment() free it.
+		 * Buffer is full.  Write the updated buffer to disk so that
+		 * fiting_resegment() can read it, then call resegment.
 		 */
-		write_buffer_page(indexRelation, &meta, seg, buf, num_buf);
+		write_buffer_page(indexRelation, &meta, counts, seg, buf, num_buf);
 		seg->num_buffer_tuples = num_buf;
 
-		/* Write dir (with updated buf_blkno/num_buffer_tuples) + meta */
-		write_dir_page(indexRelation, dir, meta.num_segments);
-		write_meta_page(indexRelation, &meta);
+		/* Persist dir + meta+counts before resegment reads them */
+		fiting_write_dir_page(indexRelation, dir);
+		fiting_write_meta_and_counts(indexRelation, &meta, counts);
 
-		/* Re-read the freshly written dir (resegment will read from disk) */
+		/* Re-read fresh copies (resegment reads from disk) */
 		pfree(dir);
-		dir = read_dir_copy(indexRelation, meta.num_segments);
-		meta = read_meta_copy(indexRelation);
+		dir  = fiting_read_dir_copy(indexRelation);
+		meta = fiting_read_meta_and_counts(indexRelation, counts);
 
 		/*
 		 * fiting_resegment merges live data + buffer, runs ShrinkingCone,
-		 * writes new pages, frees old pages, and writes dir + meta to disk.
+		 * writes new pages, frees old pages, updates dir + meta+counts on disk.
+		 * On return, meta and dir in memory reflect the post-resegment state.
 		 */
-		fiting_resegment(indexRelation, &meta, dir, seg_idx);
+		fiting_resegment(indexRelation, &meta, counts, dir, seg_idx);
 
 		/*
-		 * meta.total_tuples was adjusted inside fiting_resegment to subtract
-		 * deleted entries.  Add 1 for the newly inserted live tuple.
+		 * Re-read meta to get the post-resegment state (resegment wrote it),
+		 * increment total for the newly inserted live tuple.
 		 */
-		meta = read_meta_copy(indexRelation);
+		meta = fiting_read_meta_and_counts(indexRelation, counts);
 		meta.total_tuples++;
-		write_meta_page(indexRelation, &meta);
+		fiting_write_meta_and_counts(indexRelation, &meta, counts);
 	}
 	else
 	{
 		/* Buffer not yet full — write back and update meta/dir */
-		write_buffer_page(indexRelation, &meta, seg, buf, num_buf);
+		write_buffer_page(indexRelation, &meta, counts, seg, buf, num_buf);
 		seg->num_buffer_tuples = num_buf;
 		meta.total_tuples++;
 
-		write_dir_page(indexRelation, dir, meta.num_segments);
-		write_meta_page(indexRelation, &meta);
+		fiting_write_dir_page(indexRelation, dir);
+		fiting_write_meta_and_counts(indexRelation, &meta, counts);
 	}
 
 	pfree(buf);
 	pfree(dir);
+	pfree(counts);
 
 	return false;				/* not a unique index */
 }

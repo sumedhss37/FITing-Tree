@@ -19,6 +19,17 @@ PG_MODULE_MAGIC_EXT(
 					.version = PG_VERSION
 );
 
+/*
+ * _PG_init — called once when the shared library is loaded.
+ * Registers the FITing-Tree reloption keys so they are available before
+ * any index with those options is created or opened.
+ */
+void
+_PG_init(void)
+{
+	fiting_options_init();
+}
+
 PG_FUNCTION_INFO_V1(fiting_handler);
 
 /*
@@ -73,7 +84,7 @@ fiting_handler(PG_FUNCTION_ARGS)
 		.amcanreturn = NULL,
 		.amcostestimate = fiting_costestimate,
 		.amgettreeheight = NULL,
-		.amoptions = NULL,
+		.amoptions = fiting_options,
 		.amproperty = NULL,
 		.ambuildphasename = NULL,
 		.amvalidate = fiting_validate,
