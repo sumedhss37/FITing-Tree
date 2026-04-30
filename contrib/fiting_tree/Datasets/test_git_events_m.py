@@ -20,6 +20,11 @@ def run_test_suite(index_type, bulk_df, insert_df):
     conn = psycopg2.connect(**DB_CONFIG)
     conn.autocommit = True
     cur = conn.cursor()
+
+    cur.execute("SELECT pg_backend_pid();")
+    print("Backend PID:", cur.fetchone()[0])
+
+    input("Attach debugger now, then press Enter...")
     
     table_name = f"test_gh_{index_type}"
     
@@ -102,7 +107,7 @@ df = pd.read_csv(CSV_FILE)
 df = df.sample(frac=1).reset_index(drop=True)
 
 # Split 80/20
-split_idx = int(len(df) * 0.68)
+split_idx = int(len(df) * 0.6)
 last_idx = int(len(df) * 0.7)
 bulk_data = df.iloc[:split_idx]
 insert_data = df.iloc[split_idx:last_idx]

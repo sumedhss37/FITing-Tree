@@ -327,42 +327,41 @@ fiting_write_meta_and_counts(Relation index, const FitingMetaPageData *meta,
 /* -----------------------------------------------------------------------
  * fiting_read_dir_copy
  *
- * Read the directory page and return a palloc'd copy of the full
- * FitingDirPageContent (header + entries + node pool).
+ * Palloc a copy of the primary directory page content (block 1).
  * ----------------------------------------------------------------------- */
 FitingDirPageContent *
 fiting_read_dir_copy(Relation index)
 {
-	Buffer				buf;
-	Page				page;
-	FitingDirPageContent *copy;
+	FitingDirPageContent *dir;
+	Buffer				  buf;
+	Page				  page;
+
+	dir = palloc(sizeof(FitingDirPageContent));
 
 	buf  = ReadBuffer(index, FITING_DIR_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-
-	copy = palloc(sizeof(FitingDirPageContent));
-	memcpy(copy, FitingPageGetDirContent(page), sizeof(FitingDirPageContent));
-
+	memcpy(dir, PageGetContents(page), sizeof(FitingDirPageContent));
 	UnlockReleaseBuffer(buf);
-	return copy;
+
+	return dir;
 }
 
 /* -----------------------------------------------------------------------
  * fiting_write_dir_page
  *
- * Overwrite the directory page with the in-memory content.
+ * Write the in-memory FitingDirPageContent back to the primary directory
+ * page (block 1) via GenericXLog.
  * ----------------------------------------------------------------------- */
 void
 fiting_write_dir_page(Relation index, const FitingDirPageContent *dir)
 {
-	Buffer				buf;
-	Page				page;
-	GenericXLogState   *xstate;
+	Buffer			  buf;
+	Page			  page;
+	GenericXLogState *xstate;
 
-	buf  = ReadBuffer(index, FITING_DIR_BLKNO);
+	buf    = ReadBuffer(index, FITING_DIR_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
 	xstate = GenericXLogStart(index);
 	page   = GenericXLogRegisterBuffer(xstate, buf, GENERIC_XLOG_FULL_IMAGE);
 
@@ -382,34 +381,29 @@ fiting_write_dir_page(Relation index, const FitingDirPageContent *dir)
  * fiting_get_node
  *
  * Read the FitingPageListNode at global index node_idx into *out.
- * Nodes 0..FITING_DIR_MAX_NODES-1 are served from the in-memory dir copy.
- * Higher indices walk the overflow page chain via ReadBuffer.
+ * All nodes live in overflow dir pages chained from dir->hdr.next_page.
+ * Mapping: page_num = node_idx / FITING_DIR_OVERFLOW_NODES,
+ *           slot    = node_idx % FITING_DIR_OVERFLOW_NODES.
  * ----------------------------------------------------------------------- */
 void
 fiting_get_node(Relation index, const FitingDirPageContent *dir,
 				int node_idx, FitingPageListNode *out)
 {
-	int			ov_idx;
 	int			page_num;
 	int			slot;
 	int			i;
 	BlockNumber	blkno;
 	Buffer		buf;
 	Page		page;
+	FitingPageListNode *pool_area;
 
 	if (node_idx < 0)
 		elog(ERROR, "fiting_tree: fiting_get_node called with node_idx=%d",
 			 node_idx);
 
-	if (node_idx < FITING_DIR_MAX_NODES)
-	{
-		*out = dir->pool[node_idx];
-		return;
-	}
-
-	ov_idx   = node_idx - FITING_DIR_MAX_NODES;
-	page_num = ov_idx / FITING_DIR_OVERFLOW_NODES;
-	slot     = ov_idx % FITING_DIR_OVERFLOW_NODES;
+	/* All nodes live in overflow pages */
+	page_num = node_idx / FITING_DIR_OVERFLOW_NODES;
+	slot     = node_idx % FITING_DIR_OVERFLOW_NODES;
 
 	blkno = dir->hdr.next_page;
 
@@ -435,33 +429,29 @@ fiting_get_node(Relation index, const FitingDirPageContent *dir,
 		elog(ERROR, "fiting_tree: overflow dir page not found for node %d",
 			 node_idx);
 
-	{
-		FitingPageListNode *pool_area;
-
-		buf       = ReadBuffer(index, blkno);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page      = BufferGetPage(buf);
-		pool_area = (FitingPageListNode *)
-					((char *) PageGetContents(page) +
-					 sizeof(FitingDirOverflowHeader));
-		*out      = pool_area[slot];
-		UnlockReleaseBuffer(buf);
-	}
+	buf       = ReadBuffer(index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page      = BufferGetPage(buf);
+	pool_area = (FitingPageListNode *)
+				((char *) PageGetContents(page) +
+				 sizeof(FitingDirOverflowHeader));
+	*out      = pool_area[slot];
+	UnlockReleaseBuffer(buf);
 }
 
 /* -----------------------------------------------------------------------
  * fiting_put_node
  *
- * Write *node to global index node_idx in the directory pool.
- * Primary nodes are updated in the in-memory dir copy (flushed later by
- * fiting_write_dir_page).  Overflow nodes are written immediately via
- * GenericXLog with flag 0 (preserve other slots on the overflow page).
+ * Write *node to global index node_idx in the overflow dir page pool.
+ * All nodes live in overflow pages; written immediately via GenericXLog
+ * with flag 0 (preserve other slots on the same overflow page).
+ * Mapping: page_num = node_idx / FITING_DIR_OVERFLOW_NODES,
+ *           slot    = node_idx % FITING_DIR_OVERFLOW_NODES.
  * ----------------------------------------------------------------------- */
 void
 fiting_put_node(Relation index, FitingDirPageContent *dir,
 				int node_idx, const FitingPageListNode *node)
 {
-	int			ov_idx;
 	int			page_num;
 	int			slot;
 	int			i;
@@ -475,15 +465,9 @@ fiting_put_node(Relation index, FitingDirPageContent *dir,
 		elog(ERROR, "fiting_tree: fiting_put_node called with node_idx=%d",
 			 node_idx);
 
-	if (node_idx < FITING_DIR_MAX_NODES)
-	{
-		dir->pool[node_idx] = *node;
-		return;
-	}
-
-	ov_idx   = node_idx - FITING_DIR_MAX_NODES;
-	page_num = ov_idx / FITING_DIR_OVERFLOW_NODES;
-	slot     = ov_idx % FITING_DIR_OVERFLOW_NODES;
+	/* All nodes live in overflow pages */
+	page_num = node_idx / FITING_DIR_OVERFLOW_NODES;
+	slot     = node_idx % FITING_DIR_OVERFLOW_NODES;
 
 	blkno = dir->hdr.next_page;
 
@@ -561,10 +545,10 @@ alloc_new_overflow_dir_page(Relation index, FitingDirPageContent *dir,
 	GenericXLogFinish(xstate);
 	UnlockReleaseBuffer(buf);
 
-	/* Link the new page into the overflow chain */
+	/* Link the new page into the node-pool overflow chain */
 	if (dir->hdr.next_page == InvalidBlockNumber)
 	{
-		/* First overflow page — record in in-memory dir header */
+		/* First node-pool overflow page */
 		dir->hdr.next_page = new_blkno;
 	}
 	else
@@ -603,9 +587,10 @@ alloc_new_overflow_dir_page(Relation index, FitingDirPageContent *dir,
 /* -----------------------------------------------------------------------
  * fiting_dir_alloc_node  [runtime — used by fiting_resegment]
  *
- * Pop a node from the freelist, or claim the next primary slot, or claim
- * the next slot on the current overflow page (allocating a new overflow
- * page when needed).  Returns the global node index.
+ * Pop a node from the freelist, or claim the next slot on the current
+ * overflow page (allocating a new overflow page when the current one fills).
+ * All nodes live in overflow pages; there is no primary pool on the dir page.
+ * Returns the global node index.
  * Caller must eventually flush dir via fiting_write_dir_page (for the
  * updated header fields) and meta+counts via fiting_write_meta_and_counts.
  * ----------------------------------------------------------------------- */
@@ -615,7 +600,7 @@ fiting_dir_alloc_node(FitingDirPageContent *dir, Relation index,
 {
 	int idx;
 
-	/* 1. Pop from freelist (may be a primary or overflow index) */
+	/* 1. Pop from freelist */
 	if (dir->hdr.pool_freelist >= 0)
 	{
 		FitingPageListNode fn;
@@ -623,22 +608,13 @@ fiting_dir_alloc_node(FitingDirPageContent *dir, Relation index,
 		idx = dir->hdr.pool_freelist;
 		fiting_get_node(index, dir, idx, &fn);
 		dir->hdr.pool_freelist = fn.next;
-		/* Caller will fill the node contents via fiting_put_node */
+		/* Caller fills the node contents via fiting_put_node */
 		return idx;
 	}
 
-	/* 2. Claim next primary slot */
-	if (dir->hdr.pool_size < FITING_DIR_MAX_NODES)
+	/* 2. Claim next slot on the current overflow page (or a new one) */
 	{
-		idx = dir->hdr.pool_size++;
-		/* Primary slot: caller sets via fiting_put_node (or direct dir->pool) */
-		return idx;
-	}
-
-	/* 3. Need an overflow node */
-	{
-		int ov_idx = dir->hdr.pool_size - FITING_DIR_MAX_NODES;
-		int slot   = ov_idx % FITING_DIR_OVERFLOW_NODES;
+		int slot = dir->hdr.pool_size % FITING_DIR_OVERFLOW_NODES;
 
 		if (slot == 0)
 			/* First slot on a new overflow page — allocate the page now */
@@ -674,56 +650,39 @@ fiting_dir_free_node(FitingDirPageContent *dir, int node_idx, Relation index)
 /* -----------------------------------------------------------------------
  * build_alloc_node  [static — build-time only]
  *
- * In-memory-only allocation used during fiting_build Phase 4.  Primary
- * nodes go directly into dir->pool[]; overflow nodes go into the caller's
- * *ovpool array (grown with repalloc as needed).  No disk I/O.
+ * In-memory-only allocation used during fiting_build Phase 4.  All nodes
+ * go into the caller's *ovpool array (grown with repalloc as needed).
+ * No disk I/O; the pool is flushed to overflow dir pages in Phase 5.
  * ----------------------------------------------------------------------- */
 static int
 build_alloc_node(FitingDirPageContent *dir,
 				 FitingPageListNode **ovpool,
 				 int *ov_alloc)
 {
-	int idx;
+	int ov_idx = dir->hdr.pool_size;	/* global index = direct ovpool index */
 
-	if (dir->hdr.pool_size < FITING_DIR_MAX_NODES)
+	if (ov_idx >= *ov_alloc)
 	{
-		idx = dir->hdr.pool_size++;
-		dir->pool[idx].page_no        = InvalidBlockNumber;
-		dir->pool[idx].next           = -1;
-		dir->pool[idx].page_start_key = 0;
-		return idx;
+		*ov_alloc = (*ov_alloc == 0) ? 512 : *ov_alloc * 2;
+		if (*ovpool == NULL)
+			*ovpool = palloc(*ov_alloc * sizeof(FitingPageListNode));
+		else
+			*ovpool = repalloc(*ovpool,
+							   *ov_alloc * sizeof(FitingPageListNode));
 	}
 
-	/* Overflow */
-	{
-		int ov_idx = dir->hdr.pool_size - FITING_DIR_MAX_NODES;
-
-		if (ov_idx >= *ov_alloc)
-		{
-			*ov_alloc = (*ov_alloc == 0) ? 512 : *ov_alloc * 2;
-			if (*ovpool == NULL)
-				*ovpool = palloc(*ov_alloc * sizeof(FitingPageListNode));
-			else
-				*ovpool = repalloc(*ovpool,
-								   *ov_alloc * sizeof(FitingPageListNode));
-		}
-
-		(*ovpool)[ov_idx].page_no        = InvalidBlockNumber;
-		(*ovpool)[ov_idx].next           = -1;
-		(*ovpool)[ov_idx].page_start_key = 0;
-		idx = dir->hdr.pool_size++;
-		return idx;
-	}
+	(*ovpool)[ov_idx].page_no        = InvalidBlockNumber;
+	(*ovpool)[ov_idx].next           = -1;
+	(*ovpool)[ov_idx].page_start_key = 0;
+	dir->hdr.pool_size++;
+	return ov_idx;
 }
 
 /*
  * BUILD_NODE(ni, dir, ovpool) — pointer to the FitingPageListNode for global
- * index ni, using either the primary dir pool or the build-time overflow array.
+ * index ni.  All nodes live in ovpool (no primary dir pool any more).
  */
-#define BUILD_NODE(ni, dir_ptr, ovpool) \
-	(((ni) < FITING_DIR_MAX_NODES) \
-	 ? &(dir_ptr)->pool[(ni)] \
-	 : &(ovpool)[(ni) - FITING_DIR_MAX_NODES])
+#define BUILD_NODE(ni, dir_ptr, ovpool) (&(ovpool)[(ni)])
 
 /* =======================================================================
  * fiting_build
@@ -848,12 +807,6 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 		finals = classify_segments(segs, seg_sizes, num_segs,
 								   btree_window, btree_thresh, &nfinals);
 		pfree(seg_sizes);
-
-		if (nfinals > FITING_DIR_MAX_SEGS)
-			elog(ERROR,
-				 "fiting_tree: too many directory entries (%d, max %d). "
-				 "Increase max_error or reduce data non-linearity.",
-				 nfinals, FITING_DIR_MAX_SEGS);
 
 		elog(LOG, "fiting_tree build: %lld tuples → %d raw segs → %d dir entries "
 			 "(max_error=%d, avg seg len=%.1f)",
@@ -985,15 +938,18 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	/*
 	 * Flush build-time overflow nodes to disk.
 	 *
-	 * During Phase 4 we kept overflow nodes (pool_size > FITING_DIR_MAX_NODES)
-	 * in the palloc'd build_overflow array to avoid disk I/O before data pages
-	 * existed.  Now that data pages have been written, we extend the relation
-	 * further with overflow dir pages, copy nodes into them, link the chain,
-	 * and record dir->hdr.next_page so fiting_write_dir_page persists it.
+	 * During Phase 4 we kept all nodes in the palloc'd build_overflow array
+	 * to avoid disk I/O before data pages existed.  Now that data pages have
+	 * been written, we extend the relation with overflow dir pages, copy nodes
+	 * into them, link the chain, and record dir->hdr.next_page so that
+	 * fiting_write_dir_page persists it.
+	 *
+	 * Every non-empty index has at least one node, so this block always runs
+	 * when build_overflow != NULL.
 	 */
-	if (dir->hdr.pool_size > FITING_DIR_MAX_NODES && build_overflow != NULL)
+	if (dir->hdr.pool_size > 0 && build_overflow != NULL)
 	{
-		int ov_count = dir->hdr.pool_size - FITING_DIR_MAX_NODES;
+		int ov_count = dir->hdr.pool_size;	/* all nodes are in overflow pages */
 		int ov_pages = (ov_count + FITING_DIR_OVERFLOW_NODES - 1)
 					   / FITING_DIR_OVERFLOW_NODES;
 		BlockNumber *ov_blknos = palloc(ov_pages * sizeof(BlockNumber));
@@ -1073,7 +1029,7 @@ fiting_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	/* Overwrite block 0 with real meta + counts */
 	fiting_write_meta_and_counts(index, &meta, counts);
 
-	/* Overwrite block 1 with directory (header + entries + pool) */
+	/* Overwrite block 1 with directory (header + entries; pool is in overflow pages) */
 	fiting_write_dir_page(index, dir);
 
 	pfree(bs.tuples);
@@ -1580,8 +1536,9 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 								   btree_window, btree_thresh, &nfinals);
 		pfree(seg_sizes);
 
-		/* Validate we still fit in one directory page */
 		total_new_capacity = meta->num_segments - 1 + nfinals;
+
+		/* Validate we still fit in one directory page */
 		if (total_new_capacity > FITING_DIR_MAX_SEGS)
 			elog(ERROR,
 				 "fiting_tree: re-segmentation would produce %d total segments "
@@ -1797,8 +1754,8 @@ fiting_resegment(Relation index, FitingMetaPageData *meta, int32 *counts,
 			for (f = 0; f < nfinals; f++)
 				dir->entries[seg_idx + f] = new_entries[f];
 
-			meta->num_segments   += nfinals - 1;
-			dir->hdr.num_segments = meta->num_segments;
+			meta->num_segments       += nfinals - 1;
+			dir->hdr.num_segments     = meta->num_segments;
 		}
 
 		pfree(new_entries);

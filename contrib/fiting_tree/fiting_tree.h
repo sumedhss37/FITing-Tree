@@ -70,36 +70,32 @@
  *
  * The meta page's usable area = BLCKSZ − PageHeader − opaque
  *   = 8192 − 24 − 8 = 8160 bytes.
- * Fixed fields now consume 48 bytes (four new fields added); remaining
- * 8112 bytes hold int32 counts.
+ * Fixed fields consume 48 bytes; remaining 8112 bytes hold int32 counts.
  *   8112 / 4 = 2028 pages.
  */
 #define FITING_META_MAX_PAGES  2028
 
 /*
- * Directory page capacity (primary page).
+ * Directory page layout.
  *
- * FitingPageListNode is now 16 bytes (added page_start_key).
- * Dir page usable area = 8160 bytes, laid out as:
- *   FitingDirHeader          (  16 bytes)
- *   FitingDirEntry[90]       (3600 bytes)  — 90 × 40
- *   FitingPageListNode[284]  (4544 bytes)  — 284 × 16
- *   Total                    8160 bytes  ≤ 8160  ✓
+ * The primary directory page (block 1) holds FitingDirHeader (16 bytes)
+ * followed by up to FITING_DIR_MAX_SEGS FitingDirEntry records:
  *
- * When the primary pool is exhausted, overflow dir pages are allocated and
- * linked via FitingDirHeader.next_page.  Each overflow page holds a
- * FitingDirOverflowHeader (8 bytes) plus 509 FitingPageListNode records:
- *   8 + 509 × 16 = 8152 bytes  ≤ 8160  ✓
+ *   16 + 203×40 = 8136 bytes ≤ 8160 ✓
  *
- * Global node indices:
- *   0 .. 283              primary pool (in-memory copy, primary dir page)
- *   284 .. 792            first overflow page  (509 nodes)
- *   793 .. 1301           second overflow page
- *   …
+ * FitingDirHeader.next_page → first node-pool overflow page
+ *   (InvalidBlockNumber = no overflow pages yet)
+ *
+ * Node pool lives entirely in overflow pages linked from hdr.next_page.
+ * Each overflow page holds FitingDirOverflowHeader (8 B) + 509 nodes:
+ *   8 + 509 × 16 = 8152 bytes ≤ 8160 ✓
+ *
+ * Global node indices map directly:
+ *   node_idx / 509 = overflow page number (0-based from hdr.next_page)
+ *   node_idx % 509 = slot within that page
  */
-#define FITING_DIR_MAX_SEGS        150
-#define FITING_DIR_MAX_NODES       284
-#define FITING_DIR_OVERFLOW_NODES  509
+#define FITING_DIR_MAX_SEGS          203
+#define FITING_DIR_OVERFLOW_NODES    509
 
 /*
  * Hybrid index: BTREE segment classification window.
@@ -164,31 +160,30 @@ typedef struct FitingMetaPageData
 } FitingMetaPageData;
 
 /* -----------------------------------------------------------------------
- * Block 1: directory page.
+ * Directory page (block 1) on-disk layout (PageGetContents() base):
+ *   FitingDirHeader   hdr;                    — 16 bytes
+ *   FitingDirEntry    entries[FITING_DIR_MAX_SEGS]; — 203 × 40 = 8120 bytes
  *
- * Layout (all at PageGetContents() base):
- *   FitingDirHeader          hdr;
- *   FitingDirEntry           entries[FITING_DIR_MAX_SEGS];
- *   FitingPageListNode       pool[FITING_DIR_MAX_NODES];
- *
- * Segments' data pages are now described by a linked list of
- * FitingPageListNode records allocated from the pool above.
+ * FitingDirHeader.next_page is the first node-pool overflow page
+ * (InvalidBlockNumber when no overflow pages have been allocated yet).
  * ----------------------------------------------------------------------- */
+
+/* Header of the primary directory page */
 typedef struct FitingDirHeader
 {
-	int32		num_segments;	/* segments currently stored */
-	int32		pool_size;		/* nodes ever allocated (0-indexed high-water mark) */
-	int32		pool_freelist;	/* head of free-node chain; -1 = empty */
-	BlockNumber	next_page;		/* first overflow dir page; InvalidBlockNumber = none */
+	int32		num_segments;	/* number of active segment entries */
+	int32		pool_size;		/* node-pool high-water mark */
+	int32		pool_freelist;	/* node-pool freelist head; -1 = empty */
+	BlockNumber	next_page;		/* first node-pool overflow page */
 } FitingDirHeader;				/* sizeof = 16 bytes */
 
 /*
- * Header of every overflow directory page.
+ * Header of every node-pool overflow page.
  * Immediately followed by FitingPageListNode pool[FITING_DIR_OVERFLOW_NODES].
  */
 typedef struct FitingDirOverflowHeader
 {
-	BlockNumber	next_page;		/* next overflow dir page; InvalidBlockNumber = end */
+	BlockNumber	next_page;		/* next node-pool overflow page; InvalidBlockNumber = end */
 	int32		pad;
 } FitingDirOverflowHeader;		/* sizeof = 8 bytes */
 
@@ -257,15 +252,17 @@ typedef struct FitingPageListNode
 } FitingPageListNode;				/* sizeof = 16 bytes */
 
 /*
- * Typed overlay for the full directory page content.
- * sizeof = 16 + 90×40 + 284×16 = 8160 bytes = FITING_PAGE_USABLE (8160).
+ * In-memory overlay of the primary directory page content.
+ * Cast PageGetContents(page) to this type to read/write the directory.
  */
 typedef struct FitingDirPageContent
 {
-	FitingDirHeader		hdr;
-	FitingDirEntry		entries[FITING_DIR_MAX_SEGS];
-	FitingPageListNode	pool[FITING_DIR_MAX_NODES];
-} FitingDirPageContent;		/* sizeof = 8160 bytes (fills the page exactly) */
+	FitingDirHeader	hdr;
+	FitingDirEntry	entries[FITING_DIR_MAX_SEGS];
+} FitingDirPageContent;
+
+#define FitingPageGetDirContent(page) \
+	((FitingDirPageContent *) PageGetContents(page))
 
 /* Blocks 2+: data / buffer pages — dense array of FitingLeafTuple ---------- */
 typedef struct FitingLeafTuple
@@ -342,9 +339,6 @@ typedef FitingScanOpaqueData *FitingScanOpaque;
 #define FitingMetaGetCounts(page) \
 	((int32 *)((char *) PageGetContents(page) + sizeof(FitingMetaPageData)))
 
-#define FitingPageGetDirContent(page) \
-	((FitingDirPageContent *) PageGetContents(page))
-
 #define FitingPageGetLeaf(page) \
 	((FitingLeafTuple *) PageGetContents(page))
 
@@ -401,12 +395,12 @@ extern FitingSegment *FitingRunShrinkingCone(int64 *keys, int64 n,
  * Directory node-pool helpers.
  *
  * fiting_get_node / fiting_put_node: read/write one FitingPageListNode by its
- * global index.  Primary nodes (0..FITING_DIR_MAX_NODES-1) are served from the
- * in-memory dir copy; overflow nodes trigger ReadBuffer / GenericXLog on the
- * appropriate overflow page.
+ * global index.  All nodes live in overflow dir pages chained from
+ * dir->hdr.next_page (= FitingDirHeader.next_page on block 1).
+ * Global index maps as: page = idx / 509, slot = idx % 509.
  *
- * fiting_dir_alloc_node: pop from freelist or claim the next slot, allocating a
- * new overflow dir page if the current overflow page is full.  meta and counts
+ * fiting_dir_alloc_node: pop from freelist or claim the next slot on the current
+ * overflow page, allocating a new overflow page when it fills.  meta and counts
  * are updated in memory; caller persists them.
  *
  * fiting_dir_free_node: return node_idx to the freelist.
@@ -445,6 +439,11 @@ extern FitingMetaPageData fiting_read_meta_and_counts(Relation index,
 extern void fiting_write_meta_and_counts(Relation index,
 										  const FitingMetaPageData *meta,
 										  const int32 *counts);
+/*
+ * fiting_read_dir_copy: palloc a copy of the primary directory page content.
+ * fiting_write_dir_page: write the in-memory FitingDirPageContent back to
+ *   the primary directory page (block 1).
+ */
 extern FitingDirPageContent *fiting_read_dir_copy(Relation index);
 extern void fiting_write_dir_page(Relation index,
 								   const FitingDirPageContent *dir);
