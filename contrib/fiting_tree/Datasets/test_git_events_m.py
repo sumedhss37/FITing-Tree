@@ -107,7 +107,7 @@ df = pd.read_csv(CSV_FILE)
 df = df.sample(frac=1).reset_index(drop=True)
 
 # Split 80/20
-split_idx = int(len(df) * 0.6)
+split_idx = int(len(df) * 0.1)
 last_idx = int(len(df) * 0.7)
 bulk_data = df.iloc[:split_idx]
 insert_data = df.iloc[split_idx:last_idx]
